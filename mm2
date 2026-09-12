@@ -57,6 +57,7 @@ local Stats = game:GetService("Stats")
 local TextChatService = game:GetService("TextChatService")
 
 local LocalPlayer = Players.LocalPlayer
+local bootT0 = os.clock() -- v7.1
 local _VERSION = "6.0"
 
 -- ============================================================
@@ -333,6 +334,7 @@ function Core.emit(event, ...)
 end
 
 local PlayerCache = {}
+local RoleGuiCache = {} -- v7.1: закешированный StringValue роли
 
 scanCharacter = function(player)
     local c = player and player.Character
@@ -365,6 +367,7 @@ end
 
 clearPlayer = function(player)
     PlayerCache[player] = nil
+    RoleGuiCache[player] = nil
 
     local conns = PlayerConnections[player]
     if conns then
@@ -458,17 +461,25 @@ local function detectRole(player)
         return "Unknown"
     end
 
-    local gui = player:FindFirstChild("PlayerGui")
-    if gui then
-        local main = gui:FindFirstChild("MainGUI")
-        if main then
-            local value = main:FindFirstChild("Role", true)
-            if value and value:IsA("StringValue") then
-                local role = normalizeRole(value.Value)
-                if role ~= "Unknown" then
-                    return role
+    local cached = RoleGuiCache[player]
+    local value = (cached and cached.Parent and cached:IsA("StringValue")) and cached or nil
+    if not value then
+        local gui = player:FindFirstChild("PlayerGui")
+        if gui then
+            local main = gui:FindFirstChild("MainGUI")
+            if main then
+                local found = main:FindFirstChild("Role", true)
+                if found and found:IsA("StringValue") then
+                    RoleGuiCache[player] = found
+                    value = found
                 end
             end
+        end
+    end
+    if value then
+        local role = normalizeRole(value.Value)
+        if role ~= "Unknown" then
+            return role
         end
     end
     local okAttr, attrRole = pcall(function()
@@ -945,34 +956,29 @@ local function scanObjects(now)
     end
     objectScanAt = now
 
-    -- v6.0: кеш объектов карты
-    local container
+    -- v7.1: полный скан ОДИН раз; дальше новые объекты ловит DescendantAdded, тут только чистка
     if Config.ESPObjectCacheEnabled and next(ObjectCache) then
-        container = ObjectCache
-    else
-        container = workspace:FindFirstChild("Map") or workspace:FindFirstChild("Coins")
-            or workspace:FindFirstChild("CoinContainer") or workspace
-
-        if Config.ESPObjectCacheEnabled and not next(ObjectCache) then
-            for _, obj in ipairs(container:GetDescendants()) do
-                if obj:IsA("BasePart") then
-                    ObjectCache[obj] = true
+        for obj in pairs(ObjectCandidates) do
+            if not obj.Parent or not objectLooksInteresting(obj) then
+                ObjectCandidates[obj] = nil
+                if ObjectESP[obj] then
+                    safeDestroy(ObjectESP[obj])
+                    ObjectESP[obj] = nil
                 end
             end
         end
+        return
     end
 
+    local container = workspace:FindFirstChild("Map") or workspace:FindFirstChild("Coins")
+        or workspace:FindFirstChild("CoinContainer") or workspace
     local myRoot = root()
-    local cam = camera()
-    for obj in pairs(container) do
+    for _, obj in ipairs(container:GetDescendants()) do
+        if Config.ESPObjectCacheEnabled and obj:IsA("BasePart") then
+            ObjectCache[obj] = true
+        end
         if objectLooksInteresting(obj) then
             if myRoot and obj:IsA("BasePart") then
-                -- v6.0: фильтрация только видимых
-                local _, visible = cam and cam:WorldToViewportPoint(obj.Position)
-                if cam and not visible then
-                    continue
-                end
-
                 local ok, d = pcall(function()
                     return (myRoot.Position - obj.Position).Magnitude
                 end)
@@ -1006,6 +1012,7 @@ bind("ObjectAdded", workspace.DescendantAdded, function(obj)
 end)
 
 bind("ObjectRemoved", workspace.DescendantRemoving, function(obj)
+    ObjectCache[obj] = nil
     ObjectCandidates[obj] = nil
     if ObjectESP[obj] then
         safeDestroy(ObjectESP[obj])
@@ -1364,11 +1371,10 @@ local function updateAimCircle()
             f.Visible = Config.AimAssist and Config.AimCircle
         end
         if VisualState.FOVCircle then pcall(function() VisualState.FOVCircle.Visible = false end) end
-        -- индикатор лока цели: подсвечиваем рамку красным если есть цель
+        -- v7.1: лок-индикатор из кэша AimLock (поиск цели тут вешал каждый кадр)
         if f and Config.AimAssist then
-            local t = closestTarget()
             local stroke = f:FindFirstChildOfClass("UIStroke")
-            if stroke then stroke.Color = t and Color3.fromRGB(255, 70, 70) or Color3.fromRGB(255, 255, 255) end
+            if stroke then stroke.Color = (AimLock.part ~= nil) and Color3.fromRGB(255, 70, 70) or Color3.fromRGB(255, 255, 255) end
         end
         return
     end
@@ -1432,6 +1438,10 @@ bind("AimAssist", RunService.RenderStepped, function()
         end
         local desired = CFrame.lookAt(cam.CFrame.Position, aimPos)
         cam.CFrame = cam.CFrame:Lerp(desired, alpha)
+    end
+    -- v7.1: цвет FOV по локу
+    if VisualState.FOVCircle then
+        pcall(function() VisualState.FOVCircle.Color = target and Color3.fromRGB(255, 70, 70) or Color3.fromRGB(255, 255, 255) end)
     end
 end)
 
@@ -2291,7 +2301,7 @@ local function setMobileButtons(v)
         Config.AimAssist = not Config.AimAssist
         notify("Cinder v7.0", "Aim: " .. tostring(Config.AimAssist), 2)
     end, false, 14)
-    mkBtn("⚡", UDim2.new(1, -btnSize*3 - 10, 1, -btnSize - 10), function())
+    mkBtn("⚡", UDim2.new(1, -btnSize*3 - 10, 1, -btnSize - 10), function()
         Config.AutoPerf = not Config.AutoPerf
         notify("Cinder v6.0", "AutoPerf: " .. tostring(Config.AutoPerf), 2)
     end, false, 14)
@@ -3245,8 +3255,8 @@ end)
 
 createPingWidget()
 
-notify("Cinder MM2 v7.0", string.format("Modular Core • FPS %d • AutoPerf %s • GodMode %s • ESP Mode: %s",
-    Perf.fps, Config.AutoPerf and "ON" or "OFF", Config.GodMode and "ON" or "OFF", Config.ESPMode), 4)
+notify("Cinder MM2 v7.1", string.format("Modular Core • загрузка %.1fc • AutoPerf %s • GodMode %s • ESP: %s",
+    os.clock() - bootT0, Config.AutoPerf and "ON" or "OFF", Config.GodMode and "ON" or "OFF", Config.ESPMode), 4)
 
 -- Self-update (всегда)
 checkForUpdates()
