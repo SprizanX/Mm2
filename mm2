@@ -1,4 +1,11 @@
 --[[
+    CINDER MM2 HUB v8.0  (SPEED UPDATE)
+    Что нового в v8.0:
+      • Загрузка: кэш Rayfield на диске (тёплый старт без сети) + фоновая ревалидация
+      • Загрузка: DISABLE_RAYFIELD_REQUESTS (без аналитики/лишних fetch), ретраи по 1с
+      • Рантайм: Lighting применяется только при смене (каждые 5с перепроверка)
+      • Рантайм: ESP пишет Text/Color только при изменении, billboard.Enabled по guard
+      • Рантайм: noclip/movement в планировщике только когда реально нужны
     CINDER MM2 HUB v7.2
     Modular Core / Event-driven / Mobile + AutoPerf + GodMode + Farm
     Что нового в v7.0:
@@ -71,27 +78,51 @@ local function bootNote(txt)
     if BootGui then pcall(function() BootGui:GetChildren()[1].Text = txt end) end
 end
 
+pcall(function() getgenv().DISABLE_RAYFIELD_REQUESTS = true end) -- v8.0: без аналитики Rayfield (минус 1-2 fetch при старте)
 local RayfieldSource = nil
-bootNote("Cinder v7.2: качаю меню...")
+local _rfDir, _rfFile = "CinderMM2", "CinderMM2/rayfield_cache.lua"
+local _hasFS = (typeof(readfile) == "function" and typeof(writefile) == "function" and typeof(isfile) == "function")
+if _hasFS then pcall(function()
+    if typeof(makefolder) == "function" and typeof(isfolder) == "function" and not isfolder(_rfDir) then makefolder(_rfDir) end
+end) end
+local _rfFromCache = false
+if _hasFS then pcall(function()
+    if isfile(_rfFile) then local c = readfile(_rfFile)
+        if c and #c > 50000 then RayfieldSource = c _rfFromCache = true end end
+end) end
 local _req = (syn and syn.request) or (http and http.request) or http_request or request or fluxus_request
-for _ = 1, 5 do
-    pcall(function()
-        RayfieldSource = game:HttpGet("https://sirius.menu/rayfield")
-        if not (RayfieldSource and #RayfieldSource > 100) and _req then pcall(function()
-            local r = _req({Url = "https://sirius.menu/rayfield", Method = "GET"})
-            local body = type(r) == "table" and (r.Body or r.body or r.Content) or (type(r) == "string" and r or nil)
-            if body and #body > 100 then RayfieldSource = body end
-        end) end
+local function _fetchRayfield()
+    local body = nil
+    pcall(function() body = game:HttpGet("https://sirius.menu/rayfield") end)
+    if not (body and #body > 100) and _req then pcall(function()
+        local r = _req({Url = "https://sirius.menu/rayfield", Method = "GET"})
+        local b = type(r) == "table" and (r.Body or r.body or r.Content) or (type(r) == "string" and r or nil)
+        if b and #b > 100 then body = b end
+    end) end
+    if body and #body > 100 then return body end
+    return nil
+end
+if _rfFromCache then
+    bootNote("Cinder v8.0: меню из кэша...")
+    task.spawn(function() -- v8.0: фоновая ревалидация кэша, следующий запуск уже свежий
+        local fresh = _fetchRayfield()
+        if fresh and fresh ~= RayfieldSource then pcall(function() writefile(_rfFile, fresh) end) end
     end)
-    if RayfieldSource and #RayfieldSource > 100 then break end
-    bootNote("Cinder v7.3: повтор (" .. _ .. "/5)...")
-    task.wait(2)
+else
+    bootNote("Cinder v8.0: качаю меню...")
+    for _ = 1, 4 do
+        RayfieldSource = _fetchRayfield()
+        if RayfieldSource then break end
+        bootNote("Cinder v8.0: повтор (" .. _ .. "/4)...")
+        task.wait(1)
+    end
+    if RayfieldSource and _hasFS then pcall(function() writefile(_rfFile, RayfieldSource) end) end
 end
 if not (RayfieldSource and #RayfieldSource > 100) then
     bootNote("Cinder: нет связи с sirius.menu")
 end
 assert(RayfieldSource and #RayfieldSource > 100, "Cinder: не удалось загрузить Rayfield (sirius.menu недоступен)")
-bootNote("Cinder v7.2: меню ок, старт...")
+bootNote("Cinder v8.0: меню ок, старт...")
 local Rayfield = nil
 do
     local ok, lib = pcall(function() return loadstring(RayfieldSource)() end)
@@ -108,7 +139,7 @@ local Stats = game:GetService("Stats")
 local TextChatService = game:GetService("TextChatService")
 
 local LocalPlayer = Players.LocalPlayer
-local _VERSION = "7.3-arceusfix"
+local _VERSION = "8.0"
 
 -- ============================================================
 -- CONFIG
@@ -826,9 +857,9 @@ updateESP = function(now)
                 if data then
                     local color = roleColor(role)
 
-                    if data.box then
-                        data.box.Color3 = color
-                        data.box.Transparency = Config.ESPTransparency
+                    if data.box then -- v8.0: пишем пропсы только при изменении
+                        if data._boxColor ~= color then data.box.Color3 = color data._boxColor = color end
+                        if data._boxTransp ~= Config.ESPTransparency then data.box.Transparency = Config.ESPTransparency data._boxTransp = Config.ESPTransparency end
                     end
 
                     if data.drawingBox then
@@ -850,13 +881,10 @@ updateESP = function(now)
                         end
                     end
 
-                    if data.label then
-                        if Config.ESPNames then
-                            data.label.Text = player.Name .. " [" .. role .. "]" .. distanceText
-                        else
-                            data.label.Text = role .. distanceText
-                        end
-                        data.label.TextColor3 = color
+                    if data.label then -- v8.0: текст/цвет только при изменении
+                        local _txt = Config.ESPNames and (player.Name .. " [" .. role .. "]" .. distanceText) or (role .. distanceText)
+                        if data.label.Text ~= _txt then data.label.Text = _txt end
+                        if data._labelColor ~= color then data.label.TextColor3 = color data._labelColor = color end
                     end
 
                     -- v6.0: multi-level LOD
@@ -864,21 +892,17 @@ updateESP = function(now)
                     local isFar = dist > Config.ESPLodDistance
                     local isVeryFar = dist > Config.ESPLodFarDistance
 
-                    if data.health and cache.Humanoid and not isFar then
-                        data.health.Text = string.format(
-                            "HP: %d/%d",
-                            math.floor(cache.Humanoid.Health),
-                            math.floor(cache.Humanoid.MaxHealth)
-                        )
+                    if data.health and cache.Humanoid and not isFar then -- v8.0: HP-текст только при изменении
+                        local _hp = string.format("HP: %d/%d", math.floor(cache.Humanoid.Health), math.floor(cache.Humanoid.MaxHealth))
+                        if data.health.Text ~= _hp then data.health.Text = _hp end
                     elseif data.health then
-                        data.health.Text = ""
+                        if data.health.Text ~= "" then data.health.Text = "" end
                     end
 
-                    -- v6.0: Billboard скрывается очень далеко
-                    if isVeryFar and data.billboard then
-                        data.billboard.Enabled = false
-                    else
-                        data.billboard.Enabled = true
+                    -- v6.0: Billboard скрывается очень далеко (v8.0: guard)
+                    if data.billboard then
+                        local _wantBB = not isVeryFar
+                        if data.billboard.Enabled ~= _wantBB then data.billboard.Enabled = _wantBB end
                     end
 
                     -- v6.0: Drawing2D LOD — скрывать label далеко
@@ -1761,6 +1785,11 @@ local function restoreLighting()
 end
 
 local function updateClientVisuals()
+    local _sig = (Config.FullBright and "B" or "-") .. (Config.NoFog and "F" or "-") .. tostring(Config.FullBrightIntensity or 2)
+    local _nowL = os.clock()
+    if _sig == VisualState._lightSig and _nowL - (VisualState._lightAt or 0) < 5 then return end -- v8.0: не дёргаем Lighting каждый кадр
+    VisualState._lightSig = _sig
+    VisualState._lightAt = _nowL
     if Config.FullBright then
         saveFullBright()
         local intensity = Config.FullBrightIntensity or 2
@@ -2233,8 +2262,8 @@ bind("Scheduler", RunService.Heartbeat, function()
         lastRadar = now
     end
 
-    setMovementStats()
-    noclipStep()
+    if Config.WalkSpeedEnabled or Config.JumpEnabled or OriginalMovement.WalkSpeed ~= nil or OriginalMovement.JumpPower ~= nil then setMovementStats() end -- v8.0
+    if Config.Noclip or next(originalCollision) ~= nil then noclipStep() end -- v8.0
     updateClientVisuals()
     updateCrosshair()
     if now - (Perf._offAt or 0) >= 0.3 then
@@ -2498,9 +2527,9 @@ getgenv().CinderV6_Preset = applyPreset
 -- ============================================================
 
 local Window = Rayfield:CreateWindow({
-    Name = "Cinder MM2 v7.2",
+    Name = "Cinder MM2 v8.0",
     LoadingTitle = "Cinder MM2 Hub",
-    LoadingSubtitle = "v6.0 Modular / Mobile / AutoPerf / GodMode / ESP Mode",
+    LoadingSubtitle = "v8.0 Speed / Mobile / AutoPerf",
     ConfigurationSaving = {
         Enabled = (typeof(isfolder) == "function" and typeof(writefile) == "function"),
         FolderName = "CinderMM2",
