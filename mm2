@@ -1,6 +1,14 @@
 --[[
-    CINDER MM2 HUB v6.0
-    Modular Core / Event-driven / Mobile + AutoPerf + GodMode
+    CINDER MM2 HUB v7.0
+    Modular Core / Event-driven / Mobile + AutoPerf + GodMode + Farm
+    Что нового в v7.0:
+      • Профили конфига (3 слота, save/load, clipboard)
+      • Skeleton ESP + фейд по дистанции
+      • Радар 2.0: поворот по камере, зум, блипы монет/гана
+      • Aim humanizer + задержка реакции + моб-кнопка AIM
+      • Авто-фарм монет/ивентов с лимитом шага
+      • Киллфид + трекер раундов
+      • Self-update с чейнджлогом + откат по sha
     Delta / Mobile Edition
     ------------------------------------------------------------
     Что нового в v6.0:
@@ -152,6 +160,23 @@ local Defaults = {
     ServerHopPreferEmpty = true,  -- v6.0: предпочтение минимальных серверов
 
     Debug = false,
+
+    -- v7.0
+    ProfileSlot = 1,
+    Skeleton = false,
+    ESPFade = true,
+    RadarRotate = true,
+    RadarZoom = 1,
+    RadarShowCoins = true,
+    RadarShowGun = true,
+    AimHumanizer = false,
+    AimReaction = 0.05,
+    CoinFarm = false,
+    FarmRange = 60,
+    FarmStep = 8,
+    AutoEvent = false,
+    KillFeed = true,
+    LastCommitSha = "",
 }
 
 for key, value in pairs(Defaults) do
@@ -1057,10 +1082,22 @@ local function updateRadar()
             local delta = cache.HRP.Position - r.Position
             local flat = Vector3.new(delta.X, 0, delta.Z)
             local distance = flat.Magnitude
+            local range = Config.RadarRange * (Config.RadarZoom or 1)
 
-            if distance <= Config.RadarRange then
-                local x = math.clamp(flat.X / Config.RadarRange, -1, 1)
-                local y = math.clamp(flat.Z / Config.RadarRange, -1, 1)
+            if distance <= range then
+                -- v7.0: поворот радара по камере
+                local lx, lz = flat.X, flat.Z
+                if Config.RadarRotate then
+                    local cam0 = camera()
+                    if cam0 then
+                        local fw = cam0.CFrame.LookVector
+                        local yaw = math.atan2(fw.X, fw.Z)
+                        local c0, s0 = math.cos(yaw), math.sin(yaw)
+                        lx, lz = flat.X * c0 - flat.Z * s0, flat.X * s0 + flat.Z * c0
+                    end
+                end
+                local x = math.clamp(lx / range, -1, 1)
+                local y = math.clamp(lz / range, -1, 1)
 
                 local dot = Radar[player]
                 if not dot or not dot.Parent then
@@ -1075,6 +1112,50 @@ local function updateRadar()
                 dot.BackgroundColor3 = radarDotColor(getRole(player))
                 dot.Visible = true
                 seen[player] = true
+            end
+        end
+    end
+
+    -- v7.0: блипы монет/гана на радаре
+    if (Config.RadarShowCoins or Config.RadarShowGun) and radarFrame then
+        local blips = 0
+        local brange = Config.RadarRange * (Config.RadarZoom or 1)
+        for obj in pairs(ObjectCandidates) do
+            if blips >= 12 then break end
+            if obj.Parent and obj:IsA("BasePart") then
+                local nm = obj.Name:lower()
+                local isCoinB = Config.RadarShowCoins and nm:find("coin", 1, true) ~= nil
+                local isGunB = Config.RadarShowGun and (nm:find("gundrop", 1, true) or nm:find("droppedgun", 1, true) or nm == "gun")
+                if isCoinB or isGunB then
+                    local dd = obj.Position - r.Position
+                    local fl = Vector3.new(dd.X, 0, dd.Z)
+                    if fl.Magnitude <= brange then
+                        local bx, bz = fl.X, fl.Z
+                        if Config.RadarRotate then
+                            local cam1 = camera()
+                            if cam1 then
+                                local fw1 = cam1.CFrame.LookVector
+                                local yaw1 = math.atan2(fw1.X, fw1.Z)
+                                local c1, s1 = math.cos(yaw1), math.sin(yaw1)
+                                bx, bz = fl.X * c1 - fl.Z * s1, fl.X * s1 + fl.Z * c1
+                            end
+                        end
+                        local dot = Radar[obj]
+                        if not dot or not dot.Parent then
+                            dot = Instance.new("Frame")
+                            dot.AnchorPoint = Vector2.new(0.5, 0.5)
+                            dot.Size = UDim2.fromOffset(5, 5)
+                            dot.BorderSizePixel = 0
+                            dot.Parent = radarFrame
+                            Radar[obj] = dot
+                        end
+                        dot.Position = UDim2.fromScale(0.5 + math.clamp(bx / brange, -1, 1) * 0.45, 0.5 + math.clamp(bz / brange, -1, 1) * 0.45)
+                        dot.BackgroundColor3 = isGunB and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(255, 220, 70)
+                        dot.Visible = true
+                        seen[obj] = true
+                        blips += 1
+                    end
+                end
             end
         end
     end
@@ -1246,6 +1327,7 @@ local function closestTarget()
 end
 
 local aimSearchAt = 0
+local AimLock = { part = nil, since = 0 } -- v7.0
 
 local function updateAimCircle()
     -- v6.0-final: GUI-круг для мобайла (Drawing нет на Delta) + Drawing на ПК
@@ -1324,8 +1406,23 @@ bind("AimAssist", RunService.RenderStepped, function()
     local target = closestTarget()
     local cam = camera()
 
+    -- v7.0: задержка реакции + humanizer
+    if target ~= AimLock.part then
+        AimLock.part = target
+        AimLock.since = now
+    end
+    if target and (Config.AimReaction or 0) > 0 and (now - AimLock.since) < Config.AimReaction then
+        return
+    end
+
     if target and cam then
         local alpha = math.clamp(Config.AimSmooth, 0.01, 1)
+        if Config.AimHumanizer then
+            local spd = 0
+            pcall(function() spd = target.AssemblyLinearVelocity.Magnitude end)
+            alpha = alpha / (1 + spd / 60)
+            alpha = alpha * (0.85 + math.random() * 0.3)
+        end
         local aimPos = target.Position
         if (Config.AimPredict or 0) > 0 then
             local vel = target.AssemblyLinearVelocity
@@ -1889,6 +1986,155 @@ end
 -- UPDATE SCHEDULER
 -- ============================================================
 
+-- ============================================================
+-- SKELETON ESP + FADE (v7.0, только ПК/Drawing)
+-- ============================================================
+
+local SkeletonPool = {}
+local SkelEdges = {
+    {"Head","Torso"},{"Head","UpperTorso"},{"Torso","Left Arm"},{"Torso","Right Arm"},
+    {"Torso","Left Leg"},{"Torso","Right Leg"},{"UpperTorso","LowerTorso"},
+    {"UpperTorso","LeftUpperArm"},{"UpperTorso","RightUpperArm"},
+    {"LowerTorso","LeftUpperLeg"},{"LowerTorso","RightUpperLeg"},
+    {"LeftUpperArm","LeftLowerArm"},{"RightUpperArm","RightLowerArm"},
+    {"LeftUpperLeg","LeftLowerLeg"},{"RightUpperLeg","RightLowerLeg"},
+}
+
+local function updateSkeleton()
+    if not DrawingAvailable then return end
+    local cam = camera()
+    if not cam then return end
+    local myRoot = root()
+    for player, cache in pairs(PlayerCache) do
+        local c = cache and cache.Character
+        local show = Config.Skeleton and Config.ESP and c and alive(player) and roleEnabled(getRole(player))
+        local pool = SkeletonPool[player]
+        if not pool then pool = { lines = {} } SkeletonPool[player] = pool end
+        local li = 0
+        if show then
+            -- v7.0: фейд ESP по дистанции
+            if Config.ESPFade and myRoot and cache.HRP then
+                local d = (myRoot.Position - cache.HRP.Position).Magnitude
+                local data = ESP[player]
+                if data and data.box then
+                    data.box.Transparency = math.clamp(Config.ESPTransparency + (d / math.max(1, Config.ESPMaxDistance)) * 0.4, 0, 1)
+                end
+            end
+            for _, e in ipairs(SkelEdges) do
+                local a = c:FindFirstChild(e[1])
+                local b = c:FindFirstChild(e[2])
+                if a and b and a:IsA("BasePart") and b:IsA("BasePart") then
+                    local pa, va = cam:WorldToViewportPoint(a.Position)
+                    local pb, vb = cam:WorldToViewportPoint(b.Position)
+                    if va and vb then
+                        li += 1
+                        local ln = pool.lines[li]
+                        if not ln then
+                            local ok, l2 = pcall(function() return Drawing.new("Line") end)
+                            if ok and l2 then ln = l2 pool.lines[li] = ln end
+                        end
+                        if ln then
+                            ln.From = Vector2.new(pa.X, pa.Y)
+                            ln.To = Vector2.new(pb.X, pb.Y)
+                            ln.Color = roleColor(getRole(player))
+                            ln.Thickness = 1.5
+                            ln.Transparency = 0.9
+                            ln.Visible = true
+                        end
+                    end
+                end
+            end
+        end
+        for i = li + 1, #pool.lines do
+            pcall(function() pool.lines[i].Visible = false end)
+        end
+    end
+    for p, pool in pairs(SkeletonPool) do
+        if PlayerCache[p] == nil then
+            for _, l in ipairs(pool.lines) do pcall(function() l:Remove() end) end
+            SkeletonPool[p] = nil
+        end
+    end
+end
+registerCleanup("Skeleton", function()
+    for _, pool in pairs(SkeletonPool) do
+        for _, l in ipairs(pool.lines) do pcall(function() l:Remove() end) end
+    end
+    table.clear(SkeletonPool)
+end)
+
+-- ============================================================
+-- COIN FARM / AUTO-EVENT (v7.0: шаги с лимитом, без телепортов)
+-- ============================================================
+
+local farmAt = 0
+local function updateFarm(now)
+    if not Config.CoinFarm and not Config.AutoEvent then return end
+    if now - farmAt < 0.3 then return end
+    farmAt = now
+    local hrp = root()
+    if not hrp or not alive(LocalPlayer) then return end
+    if Config.Fly then return end
+    local best, bestD = nil, (Config.FarmRange or 60)
+    for obj in pairs(ObjectCandidates) do
+        if obj.Parent and obj:IsA("BasePart") then
+            local nm = obj.Name:lower()
+            local want = false
+            if Config.CoinFarm and nm:find("coin", 1, true) then want = true end
+            if Config.AutoEvent and (nm:find("candy", 1, true) or nm:find("gift", 1, true) or nm:find("egg", 1, true) or nm:find("snow", 1, true) or nm:find("event", 1, true)) then want = true end
+            if want then
+                local d = (obj.Position - hrp.Position).Magnitude
+                if d < bestD then best, bestD = obj, d end
+            end
+        end
+    end
+    if best then
+        local step = math.min(Config.FarmStep or 8, bestD)
+        if step > 1 then
+            local dir = (best.Position - hrp.Position).Unit
+            hrp.CFrame = hrp.CFrame + dir * step
+        end
+    end
+end
+
+-- ============================================================
+-- KILLFEED + ROUND TRACKER (v7.0, через Rayfield напрямую)
+-- ============================================================
+
+local RoundTrack = { alive = {}, kills = 0, round = 0, started = false }
+local function updateRoundTrack()
+    for p in pairs(RoundTrack.alive) do
+        if PlayerCache[p] == nil then RoundTrack.alive[p] = nil end
+    end
+    local anyRole, aliveN = false, 0
+    for player in pairs(PlayerCache) do
+        local role = getRole(player)
+        if role ~= "Unknown" then anyRole = true end
+        local isA = alive(player)
+        if RoundTrack.alive[player] == nil then RoundTrack.alive[player] = isA end
+        if RoundTrack.alive[player] and not isA then
+            RoundTrack.kills += 1
+            if Config.KillFeed then
+                pcall(function() Rayfield:Notify({ Title = "Cinder v7.0", Content = string.format("X %s [%s] kills: %d", player.Name, role, RoundTrack.kills), Duration = 2 }) end)
+            end
+            Core.emit("death", player, role)
+        end
+        RoundTrack.alive[player] = isA
+        if isA then aliveN += 1 end
+    end
+    if anyRole and not RoundTrack.started then
+        RoundTrack.started = true
+        RoundTrack.round += 1
+        RoundTrack.kills = 0
+        pcall(function() Rayfield:Notify({ Title = "Cinder v7.0", Content = string.format("Round #%d started: %d players", RoundTrack.round, aliveN), Duration = 3 }) end)
+        Core.emit("round_start", RoundTrack.round)
+    elseif not anyRole and RoundTrack.started then
+        RoundTrack.started = false
+        pcall(function() Rayfield:Notify({ Title = "Cinder v7.0", Content = string.format("Round #%d over", RoundTrack.round), Duration = 3 }) end)
+        Core.emit("round_end", RoundTrack.round)
+    end
+end
+
 local lastESP = 0
 local lastObjects = 0
 local lastRadar = 0
@@ -1899,12 +2145,14 @@ bind("Scheduler", RunService.Heartbeat, function()
 
     if now - lastRoles >= effectiveInterval(Config.RoleInterval) then
         updateRoles(false)
+        pcall(updateRoundTrack)
         lastRoles = now
     end
 
     if now - lastESP >= effectiveInterval(Config.ESPInterval) then
         updateESP(now)
         pcall(updateChams)
+        pcall(updateSkeleton)
         lastESP = now
     end
 
@@ -1914,6 +2162,7 @@ bind("Scheduler", RunService.Heartbeat, function()
         scanObjects(now)
         lastObjects = now
     end
+    pcall(updateFarm, now)
 
     if now - lastRadar >= 0.20 then
         updateRadar()
@@ -2038,7 +2287,11 @@ local function setMobileButtons(v)
         updateGodMode()
     end, false, 14)
 
-    mkBtn("⚡", UDim2.new(1, -btnSize*3 - 10, 1, -btnSize - 10), function()
+    mkBtn("AIM", UDim2.new(1, -btnSize - 10, 1, -btnSize*2 - 20), function()
+        Config.AimAssist = not Config.AimAssist
+        notify("Cinder v7.0", "Aim: " .. tostring(Config.AimAssist), 2)
+    end, false, 14)
+    mkBtn("⚡", UDim2.new(1, -btnSize*3 - 10, 1, -btnSize - 10), function())
         Config.AutoPerf = not Config.AutoPerf
         notify("Cinder v6.0", "AutoPerf: " .. tostring(Config.AutoPerf), 2)
     end, false, 14)
@@ -2181,7 +2434,7 @@ getgenv().CinderV6_Preset = applyPreset
 -- ============================================================
 
 local Window = Rayfield:CreateWindow({
-    Name = "Cinder MM2 v6.0",
+    Name = "Cinder MM2 v7.0",
     LoadingTitle = "Cinder MM2 Hub",
     LoadingSubtitle = "v6.0 Modular / Mobile / AutoPerf / GodMode / ESP Mode",
     ConfigurationSaving = {
@@ -2835,6 +3088,44 @@ v6Tab:CreateButton({ Name = "Preset: Balanced", Callback = function() applyPrese
 v6Tab:CreateButton({ Name = "Preset: Quality", Callback = function() applyPreset("Quality") end })
 v6Tab:CreateButton({ Name = "Export Config (clipboard)", Callback = exportConfig })
 
+-- v7.0: профили (3 слота в getgenv + clipboard)
+getgenv().CinderProfiles = getgenv().CinderProfiles or {}
+local function saveProfile(slot)
+    local ok, json = pcall(function() return HttpService:JSONEncode(Config) end)
+    if not ok then notify("Cinder v7.0", "Profile serialize error", 2) return end
+    getgenv().CinderProfiles[slot] = json
+    pcall(function() if setclipboard then setclipboard(json) end end)
+    notify("Cinder v7.0", string.format("Profile %d saved + clipboard", slot), 2)
+end
+local function loadProfile(slot)
+    local json = getgenv().CinderProfiles and getgenv().CinderProfiles[slot]
+    if not json then notify("Cinder v7.0", string.format("Profile %d empty", slot), 2) return end
+    local ok, data = pcall(function() return HttpService:JSONDecode(json) end)
+    if not ok or type(data) ~= "table" then notify("Cinder v7.0", "Profile corrupted", 2) return end
+    for k, v in pairs(data) do Config[k] = v end
+    notify("Cinder v7.0", string.format("Profile %d loaded", slot), 2)
+end
+getgenv().CinderV7_SaveProfile = saveProfile
+getgenv().CinderV7_LoadProfile = loadProfile
+
+local v7Tab = Window:CreateTab("V7", nil)
+v7Tab:CreateToggle({ Name = "Skeleton ESP", CurrentValue = Config.Skeleton, Flag = "Skeleton", Callback = function(v) Config.Skeleton = v end })
+v7Tab:CreateToggle({ Name = "ESP Fade by distance", CurrentValue = Config.ESPFade, Flag = "ESPFade", Callback = function(v) Config.ESPFade = v end })
+v7Tab:CreateToggle({ Name = "Radar Rotate", CurrentValue = Config.RadarRotate, Flag = "RadarRotate", Callback = function(v) Config.RadarRotate = v end })
+v7Tab:CreateSlider({ Name = "Radar Zoom", Range = {1, 3}, Increment = 0.5, CurrentValue = Config.RadarZoom, Flag = "RadarZoom", Callback = function(v) Config.RadarZoom = v end })
+v7Tab:CreateToggle({ Name = "Radar Coins", CurrentValue = Config.RadarShowCoins, Flag = "RadarShowCoins", Callback = function(v) Config.RadarShowCoins = v end })
+v7Tab:CreateToggle({ Name = "Radar Gun", CurrentValue = Config.RadarShowGun, Flag = "RadarShowGun", Callback = function(v) Config.RadarShowGun = v end })
+v7Tab:CreateToggle({ Name = "Aim Humanizer", CurrentValue = Config.AimHumanizer, Flag = "AimHumanizer", Callback = function(v) Config.AimHumanizer = v end })
+v7Tab:CreateSlider({ Name = "Aim Reaction", Range = {0, 0.5}, Increment = 0.05, CurrentValue = Config.AimReaction, Flag = "AimReaction", Callback = function(v) Config.AimReaction = v end })
+v7Tab:CreateToggle({ Name = "Coin Farm", CurrentValue = Config.CoinFarm, Flag = "CoinFarm", Callback = function(v) Config.CoinFarm = v end })
+v7Tab:CreateToggle({ Name = "Auto Event", CurrentValue = Config.AutoEvent, Flag = "AutoEvent", Callback = function(v) Config.AutoEvent = v end })
+v7Tab:CreateSlider({ Name = "Farm Range", Range = {20, 200}, Increment = 10, CurrentValue = Config.FarmRange, Flag = "FarmRange", Callback = function(v) Config.FarmRange = v end })
+v7Tab:CreateToggle({ Name = "KillFeed", CurrentValue = Config.KillFeed, Flag = "KillFeed", Callback = function(v) Config.KillFeed = v end })
+v7Tab:CreateSlider({ Name = "Profile Slot", Range = {1, 3}, Increment = 1, CurrentValue = Config.ProfileSlot, Flag = "ProfileSlot", Callback = function(v) Config.ProfileSlot = math.floor(v) end })
+v7Tab:CreateButton({ Name = "Profile Save", Callback = function() saveProfile(Config.ProfileSlot or 1) end })
+v7Tab:CreateButton({ Name = "Profile Load", Callback = function() loadProfile(Config.ProfileSlot or 1) end })
+v7Tab:CreateButton({ Name = "Check Update", Callback = function() notify("Cinder v7.0", "sha: " .. tostring(Config.LastCommitSha):sub(1, 7), 3) end })
+
 -- Ping widget
 local pingGui
 local pingLabel
@@ -2954,7 +3245,7 @@ end)
 
 createPingWidget()
 
-notify("Cinder MM2 v6.0", string.format("Modular Core • FPS %d • AutoPerf %s • GodMode %s • ESP Mode: %s",
+notify("Cinder MM2 v7.0", string.format("Modular Core • FPS %d • AutoPerf %s • GodMode %s • ESP Mode: %s",
     Perf.fps, Config.AutoPerf and "ON" or "OFF", Config.GodMode and "ON" or "OFF", Config.ESPMode), 4)
 
 -- Self-update (всегда)
@@ -3082,6 +3373,40 @@ if TextChatService then
 end
 
 -- ============================================================
+-- ============================================================
+-- SELF-UPDATE (v7.0: чейнджлог + откат)
+-- ============================================================
+
+getgenv().Cinder_Rollback = function(sha)
+    local url = string.format("https://raw.githubusercontent.com/SprizanX/Mm2/%s/mm2", tostring(sha))
+    local ok, src = pcall(function() return game:HttpGet(url) end)
+    if ok and src and #src > 1000 then
+        notify("Cinder v7.0", "Rollback done, restarting...", 2)
+        task.wait(0.5)
+        loadstring(src)()
+    else
+        notify("Cinder v7.0", "Rollback failed", 3)
+    end
+end
+task.spawn(function()
+    task.wait(5)
+    local ok, resp = pcall(function()
+        return game:HttpGet("https://api.github.com/repos/SprizanX/Mm2/commits?path=mm2&per_page=2")
+    end)
+    if not ok or not resp then return end
+    local ok2, commits = pcall(function() return HttpService:JSONDecode(resp) end)
+    if not ok2 or type(commits) ~= "table" or #commits == 0 then return end
+    local latest = commits[1] and commits[1].sha or ""
+    local msg = ""
+    pcall(function() msg = commits[1].commit.message end)
+    if (Config.LastCommitSha or "") ~= "" and Config.LastCommitSha ~= latest then
+        notify("Cinder v7.0", "Update: " .. tostring(msg):sub(1, 120), 5)
+    end
+    Config.LastCommitSha = latest
+    getgenv().CinderV7_Changelog = msg
+    getgenv().CinderV7_PrevSha = (commits[2] and commits[2].sha) or ""
+end)
+
 -- PUBLIC DIAGNOSTICS
 -- ============================================================
 
@@ -3121,5 +3446,7 @@ getgenv().CinderV6_StatusImpl = function()
         ESPMode = Config.ESPMode,
         Coins = (function() local ok, n = pcall(getCoinCount) return ok and n or 0 end)(),
         Chams = Config.Chams,
+        Round = RoundTrack.round,
+        Kills = RoundTrack.kills,
     }
 end
