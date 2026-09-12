@@ -139,7 +139,7 @@ local Stats = game:GetService("Stats")
 local TextChatService = game:GetService("TextChatService")
 
 local LocalPlayer = Players.LocalPlayer
-local _VERSION = "8.0"
+local _VERSION = "8.1"
 
 -- ============================================================
 -- CONFIG
@@ -289,11 +289,7 @@ local function root()
     return c and c:FindFirstChild("HumanoidRootPart")
 end
 
-local function alive(player)
-    local c = player and player.Character
-    local h = c and c:FindFirstChildOfClass("Humanoid")
-    return h and h.Health > 0
-end
+-- v8.1-opt: alive() переехал под PlayerCache (fast path без FindFirstChild)
 
 local function safeDestroy(instance)
     if instance then
@@ -422,6 +418,18 @@ end
 
 local PlayerCache = {}
 local RoleGuiCache = {} -- v7.1: закешированный StringValue роли
+
+local function alive(player)
+    -- v8.1-opt: fast path через кеш (без FindFirstChild в горячих циклах)
+    local cache = PlayerCache[player]
+    local h = cache and cache.Humanoid
+    if h and h.Parent then
+        return h.Health > 0
+    end
+    local c = player and player.Character
+    h = c and c:FindFirstChildOfClass("Humanoid")
+    return h and h.Health > 0
+end
 
 scanCharacter = function(player)
     local c = player and player.Character
@@ -636,15 +644,22 @@ local function getRole(player)
     return cache and cache.LastRole or "Unknown"
 end
 
+-- v8.1-opt: shared Color3 constants (no per-tick allocations)
+local COLOR_MURDERER = Color3.fromRGB(255, 70, 70)
+local COLOR_SHERIFF = Color3.fromRGB(80, 130, 255)
+local COLOR_INNOCENT = Color3.fromRGB(80, 235, 110)
+local COLOR_UNKNOWN = Color3.fromRGB(220, 220, 220)
+local COLOR_WHITE = Color3.fromRGB(255, 255, 255)
+
 local function roleColor(role)
     if role == "Murderer" then
-        return Color3.fromRGB(255, 70, 70)
+        return COLOR_MURDERER
     elseif role == "Sheriff" then
-        return Color3.fromRGB(80, 130, 255)
+        return COLOR_SHERIFF
     elseif role == "Innocent" then
-        return Color3.fromRGB(80, 235, 110)
+        return COLOR_INNOCENT
     end
-    return Color3.fromRGB(220, 220, 220)
+    return COLOR_UNKNOWN
 end
 
 local function radarDotColor(role)
@@ -836,14 +851,16 @@ updateESP = function(now)
 
     local myRoot = root()
     local cam = camera()
+    local maxDist = Config.ESPMaxDistance
     for player, cache in pairs(PlayerCache) do
         if cache and cache.Head and cache.Head.Parent and alive(player) then
-            local withinRange = true
+            -- v8.1-opt: один замер дистанции на игрока за тик
+            local dist = 0
             if myRoot and cache.HRP then
-                withinRange = (myRoot.Position - cache.HRP.Position).Magnitude <= Config.ESPMaxDistance
+                dist = (myRoot.Position - cache.HRP.Position).Magnitude
             end
 
-            if not withinRange then
+            if dist > maxDist then
                 destroyESP(player)
                 continue
             end
@@ -862,23 +879,26 @@ updateESP = function(now)
                         if data._boxTransp ~= Config.ESPTransparency then data.box.Transparency = Config.ESPTransparency data._boxTransp = Config.ESPTransparency end
                     end
 
-                    if data.drawingBox then
+                    -- v8.1-opt: Drawing-ветка тоже пишет только при изменении
+                    if data.drawingBox and data._dboxColor ~= color then
                         data.drawingBox.Color = color
+                        data._dboxColor = color
                     end
 
                     if data.drawingLabel then
-                        data.drawingLabel.Text = player.Name
-                        data.drawingLabel.Color = color
+                        if not data._dnamed then
+                            data.drawingLabel.Text = player.Name
+                            data._dnamed = true
+                        end
+                        if data._dlabelColor ~= color then
+                            data.drawingLabel.Color = color
+                            data._dlabelColor = color
+                        end
                     end
 
                     local distanceText = ""
-                    if Config.ESPDistance then
-                        if myRoot and cache.HRP then
-                            distanceText = string.format(
-                                " • %dm",
-                                math.floor((myRoot.Position - cache.HRP.Position).Magnitude)
-                            )
-                        end
+                    if Config.ESPDistance and myRoot and cache.HRP then
+                        distanceText = " • " .. math.floor(dist) .. "m"
                     end
 
                     if data.label then -- v8.0: текст/цвет только при изменении
@@ -887,8 +907,7 @@ updateESP = function(now)
                         if data._labelColor ~= color then data.label.TextColor3 = color data._labelColor = color end
                     end
 
-                    -- v6.0: multi-level LOD
-                    local dist = myRoot and cache.HRP and (myRoot.Position - cache.HRP.Position).Magnitude or 0
+                    -- v6.0: multi-level LOD (v8.1-opt: dist уже посчитан выше)
                     local isFar = dist > Config.ESPLodDistance
                     local isVeryFar = dist > Config.ESPLodFarDistance
 
@@ -1159,6 +1178,17 @@ local function updateRadar()
     if not r then return end
     local seen = {}
 
+    -- v8.1-opt: yaw камеры один раз (был atan2+sin+cos на каждый дот)
+    local yawC, yawS = 1, 0
+    if Config.RadarRotate then
+        local camR = camera()
+        if camR then
+            local fw = camR.CFrame.LookVector
+            local yaw = math.atan2(fw.X, fw.Z)
+            yawC, yawS = math.cos(yaw), math.sin(yaw)
+        end
+    end
+
     for player, cache in pairs(PlayerCache) do
         -- v6.0: скрыть свой dot
         if player == LocalPlayer and Config.RadarHideSelf then
@@ -1172,16 +1202,9 @@ local function updateRadar()
             local range = Config.RadarRange * (Config.RadarZoom or 1)
 
             if distance <= range then
-                -- v7.0: поворот радара по камере
                 local lx, lz = flat.X, flat.Z
                 if Config.RadarRotate then
-                    local cam0 = camera()
-                    if cam0 then
-                        local fw = cam0.CFrame.LookVector
-                        local yaw = math.atan2(fw.X, fw.Z)
-                        local c0, s0 = math.cos(yaw), math.sin(yaw)
-                        lx, lz = flat.X * c0 - flat.Z * s0, flat.X * s0 + flat.Z * c0
-                    end
+                    lx, lz = flat.X * yawC - flat.Z * yawS, flat.X * yawS + flat.Z * yawC
                 end
                 local x = math.clamp(lx / range, -1, 1)
                 local y = math.clamp(lz / range, -1, 1)
@@ -1219,13 +1242,7 @@ local function updateRadar()
                     if fl.Magnitude <= brange then
                         local bx, bz = fl.X, fl.Z
                         if Config.RadarRotate then
-                            local cam1 = camera()
-                            if cam1 then
-                                local fw1 = cam1.CFrame.LookVector
-                                local yaw1 = math.atan2(fw1.X, fw1.Z)
-                                local c1, s1 = math.cos(yaw1), math.sin(yaw1)
-                                bx, bz = fl.X * c1 - fl.Z * s1, fl.X * s1 + fl.Z * c1
-                            end
+                            bx, bz = fl.X * yawC - fl.Z * yawS, fl.X * yawS + fl.Z * yawC
                         end
                         local dot = Radar[obj]
                         if not dot or not dot.Parent then
@@ -1270,6 +1287,11 @@ end
 local losCache = {}
 local losCacheAt = {}
 local LOS_CACHE_TTL = 0.05
+-- v8.1-opt: общие RaycastParams (без аллокации), чистка не чаще 1/с
+local losParams = RaycastParams.new()
+losParams.FilterType = Enum.RaycastFilterType.Exclude
+losParams.IgnoreWater = true
+local losPurgeAt = 0
 
 local function hasLineOfSight(part)
     if not Config.AimWallCheck then
@@ -1283,32 +1305,31 @@ local function hasLineOfSight(part)
     end
 
     local now = os.clock()
-    for k, v in pairs(losCache) do
-        if now - losCacheAt[k] > LOS_CACHE_TTL then
-            losCache[k] = nil
-            losCacheAt[k] = nil
-        end
+    -- v8.1-opt: ключ — сам instance (было GetFullName+Position: аллокация + промахи кеша)
+    local cachedAt = losCacheAt[part]
+    if cachedAt and now - cachedAt < LOS_CACHE_TTL then
+        return losCache[part]
     end
 
-    local cacheKey = part:GetFullName() .. "|" .. tostring(part.Position)
-    local cached = losCache[cacheKey]
-    local cachedAt = losCacheAt[cacheKey]
-    if cached ~= nil and cachedAt and now - cachedAt < LOS_CACHE_TTL then
-        return cached
+    if now - losPurgeAt > 1 then
+        losPurgeAt = now
+        for k, t in pairs(losCacheAt) do
+            if now - t > LOS_CACHE_TTL then
+                losCache[k] = nil
+                losCacheAt[k] = nil
+            end
+        end
     end
 
     local origin = cam.CFrame.Position
     local direction = part.Position - origin
 
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = {localChar}
-    params.IgnoreWater = true
+    losParams.FilterDescendantsInstances = {localChar}
 
-    local result = workspace:Raycast(origin, direction, params)
+    local result = workspace:Raycast(origin, direction, losParams)
     local hit = result == nil or result.Instance:IsDescendantOf(part.Parent)
-    losCache[cacheKey] = hit
-    losCacheAt[cacheKey] = now
+    losCache[part] = hit
+    losCacheAt[part] = now
     return hit
 end
 
@@ -1364,6 +1385,14 @@ local function pickAimPart(cache)
     return cache[Config.AimPart] or cache.Head or cache.HRP
 end
 
+-- v8.1-opt: таблица приоритетов наружу (была аллокация на каждый поиск 30/с)
+local ROLE_PRIORITY = {
+    ["Murderer"] = 3,
+    ["Sheriff"] = 2,
+    ["Innocent"] = 1,
+    ["Unknown"] = 0,
+}
+
 local function closestTarget()
     local cam = camera()
     if not cam then return nil end
@@ -1373,36 +1402,54 @@ local function closestTarget()
     local bestDistance = math.huge
     local bestPriority = 0
 
-    local priority = {
-        ["Murderer"] = 3,
-        ["Sheriff"] = 2,
-        ["Innocent"] = 1,
-        ["Unknown"] = 0,
-    }
-
     for player, cache in pairs(PlayerCache) do
         if cache and cache.Humanoid and cache.Humanoid.Health > 0 then
             local role = getRole(player)
             if targetAllowed(role) then
-                local part = pickAimPart(cache)
-                if part then
-                    local point, visible = cam:WorldToViewportPoint(part.Position)
-                    if visible and point.Z > 0 and hasLineOfSight(part) then
-                        local d = (Vector2.new(point.X, point.Y) - mouse).Magnitude
-                        local fov = roleFOV(role)
-
-                        -- v6.0: adaptive FOV — близкие цели сужают FOV
-                        if Config.AimAdaptiveFOV and d < fov / 4 then
-                            fov = fov / 2
+                -- v8.1-opt: проекция один раз (было 3x WorldToViewportPoint на игрока)
+                local part, px, py, pok
+                if Config.AimAutoPart and cache.Head and cache.HRP then
+                    local hp, hv = cam:WorldToViewportPoint(cache.Head.Position)
+                    local rp, rv = cam:WorldToViewportPoint(cache.HRP.Position)
+                    if hv and rv then
+                        local dhx, dhy = hp.X - mouse.X, hp.Y - mouse.Y
+                        local drx, dry = rp.X - mouse.X, rp.Y - mouse.Y
+                        if dhx * dhx + dhy * dhy <= drx * drx + dry * dry then
+                            part, px, py, pok = cache.Head, hp.X, hp.Y, true
+                        else
+                            part, px, py, pok = cache.HRP, rp.X, rp.Y, true
                         end
+                    elseif hv then
+                        part, px, py, pok = cache.Head, hp.X, hp.Y, true
+                    elseif rv then
+                        part, px, py, pok = cache.HRP, rp.X, rp.Y, true
+                    end
+                else
+                    part = cache[Config.AimPart] or cache.Head or cache.HRP
+                    if part then
+                        local pt, vis = cam:WorldToViewportPoint(part.Position)
+                        if vis and pt.Z > 0 then
+                            px, py, pok = pt.X, pt.Y, true
+                        end
+                    end
+                end
+                if part and pok then
+                    local dx, dy = px - mouse.X, py - mouse.Y
+                    local d = math.sqrt(dx * dx + dy * dy)
+                    local fov = roleFOV(role)
 
-                        if d <= fov then
-                            local p = priority[role] or 0
-                            if p > bestPriority or (p == bestPriority and d < bestDistance) then
-                                bestPriority = p
-                                bestDistance = d
-                                best = part
-                            end
+                    -- v6.0: adaptive FOV — близкие цели сужают FOV
+                    if Config.AimAdaptiveFOV and d < fov / 4 then
+                        fov = fov / 2
+                    end
+
+                    -- v8.1-opt: рейкаст ПОСЛЕДНИМ (самый дорогой; было до FOV-проверки)
+                    if d <= fov and hasLineOfSight(part) then
+                        local p = ROLE_PRIORITY[role] or 0
+                        if p > bestPriority or (p == bestPriority and d < bestDistance) then
+                            bestPriority = p
+                            bestDistance = d
+                            best = part
                         end
                     end
                 end
@@ -1415,6 +1462,7 @@ end
 
 local aimSearchAt = 0
 local AimLock = { part = nil, since = 0 } -- v7.0
+local AimMs = { v = 0 } -- v8.1-opt: avg closestTarget ms (see Status)
 
 local function updateAimCircle()
     -- v6.0-final: GUI-круг для мобайла (Drawing нет на Delta) + Drawing на ПК
@@ -1454,7 +1502,7 @@ local function updateAimCircle()
         -- v7.1: лок-индикатор из кэша AimLock (поиск цели тут вешал каждый кадр)
         if f and Config.AimAssist then
             local stroke = f:FindFirstChildOfClass("UIStroke")
-            if stroke then stroke.Color = (AimLock.part ~= nil) and Color3.fromRGB(255, 70, 70) or Color3.fromRGB(255, 255, 255) end
+            if stroke then stroke.Color = (AimLock.part ~= nil) and COLOR_MURDERER or COLOR_WHITE end
         end
         return
     end
@@ -1468,7 +1516,7 @@ local function updateAimCircle()
             circle.Filled = false
             circle.Thickness = 1.5
             circle.Transparency = 0.8
-            circle.Color = Color3.fromRGB(255, 255, 255)
+            circle.Color = COLOR_WHITE
             VisualState.FOVCircle = circle
         end
     end
@@ -1482,6 +1530,13 @@ local function updateAimCircle()
 end
 
 bind("AimAssist", RunService.RenderStepped, function()
+    -- v8.1-opt: skip circle math when both off AND already hidden
+    if not Config.AimAssist and not Config.AimCircle then
+        if VisualState.FOVCircle then pcall(function() VisualState.FOVCircle.Visible = false end) end
+        local ff = VisualState.FOVFrame
+        if ff then ff.Visible = false end
+        return
+    end
     updateAimCircle()
     if not Config.AimAssist then return end
 
@@ -1489,7 +1544,9 @@ bind("AimAssist", RunService.RenderStepped, function()
     if now - aimSearchAt < 1 / 30 then return end
     aimSearchAt = now
 
+    local tA = os.clock()
     local target = closestTarget()
+    AimMs.v = AimMs.v * 0.9 + (os.clock() - tA) * 1000 * 0.1
     local cam = camera()
 
     -- v7.0: задержка реакции + humanizer
@@ -1521,7 +1578,7 @@ bind("AimAssist", RunService.RenderStepped, function()
     end
     -- v7.1: цвет FOV по локу
     if VisualState.FOVCircle then
-        pcall(function() VisualState.FOVCircle.Color = target and Color3.fromRGB(255, 70, 70) or Color3.fromRGB(255, 255, 255) end)
+        pcall(function() VisualState.FOVCircle.Color = target and COLOR_MURDERER or COLOR_WHITE end)
     end
 end)
 
@@ -1845,7 +1902,7 @@ local function updateCrosshair()
             if ok and line then
                 line.Thickness = 2
                 line.Transparency = 0.9
-                line.Color = Color3.fromRGB(255, 255, 255)
+                line.Color = COLOR_WHITE
                 table.insert(VisualState.Crosshair, line)
             end
         end
@@ -1897,8 +1954,11 @@ Perf.interval = Perf.interval or 1
 Perf.autoCut = Perf.autoCut or false
 Perf.autoCutTracers = Perf.autoCutTracers or false
 Perf.autoCutObjects = Perf.autoCutObjects or false
+Perf.msESP = Perf.msESP or 0 -- v8.1-opt: avg ms per tick (see Status)
+Perf.msObj = Perf.msObj or 0
+Perf.msRadar = Perf.msRadar or 0
 
-bind("Performance", RunService.RenderStepped, function()
+bind("Performance", RunService.Heartbeat, function() -- v8.1-opt: FPS counter off render thread
     Perf.frameCount += 1
 
     local now = os.clock()
@@ -1943,6 +2003,28 @@ end
 local serverHopCache = {}
 local serverHopCacheAt = 0
 
+-- v8.1-opt: выбор сервера в одном месте (была копипаста x2)
+local function pickBestServer(list)
+    local bestServer = nil
+    local bestPlayers = math.huge
+    for _, server in ipairs(list or {}) do
+        if server.id ~= game.JobId
+            and server.playing
+            and server.maxPlayers
+            and server.playing < server.maxPlayers then
+            if Config.ServerHopPreferEmpty then
+                if server.playing < bestPlayers then
+                    bestPlayers = server.playing
+                    bestServer = server
+                end
+            else
+                return server
+            end
+        end
+    end
+    return bestServer
+end
+
 local function serverHop()
     local now = os.clock()
     if serverHopCacheAt > 0 and now - serverHopCacheAt < Config.ServerHopCacheTTL then
@@ -1950,24 +2032,7 @@ local function serverHop()
         if type(data) ~= "table" or type(data.data) ~= "table" then
             goto fresh
         end
-        local bestServer = nil
-        local bestPlayers = math.huge
-        for _, server in ipairs(data.data or {}) do
-            if server.id ~= game.JobId
-                and server.playing
-                and server.maxPlayers
-                and server.playing < server.maxPlayers then
-                if Config.ServerHopPreferEmpty then
-                    if server.playing < bestPlayers then
-                        bestPlayers = server.playing
-                        bestServer = server
-                    end
-                else
-                    bestServer = server
-                    break
-                end
-            end
-        end
+        local bestServer = pickBestServer(data.data)
         if bestServer then
             pcall(function()
                 TeleportService:TeleportToPlaceInstance(
@@ -2036,26 +2101,7 @@ local function serverHop()
         if cursor == "" then break end
     end
 
-    local data = { data = allServers }
-
-    local bestServer = nil
-    local bestPlayers = math.huge
-    for _, server in ipairs(data.data or {}) do
-        if server.id ~= game.JobId
-            and server.playing
-            and server.maxPlayers
-            and server.playing < server.maxPlayers then
-            if Config.ServerHopPreferEmpty then
-                if server.playing < bestPlayers then
-                    bestPlayers = server.playing
-                    bestServer = server
-                end
-            else
-                bestServer = server
-                break
-            end
-        end
-    end
+    local bestServer = pickBestServer(allServers)
 
     if bestServer then
         pcall(function()
@@ -2093,6 +2139,16 @@ local SkelEdges = {
     {"LeftUpperLeg","LeftLowerLeg"},{"RightUpperLeg","RightLowerLeg"},
 }
 
+-- v8.1-opt: уникальные имена частей — резолв BasePart один раз на персонажа
+local SkelPartNames = {}
+do
+    local seen = {}
+    for _, e in ipairs(SkelEdges) do
+        if not seen[e[1]] then seen[e[1]] = true table.insert(SkelPartNames, e[1]) end
+        if not seen[e[2]] then seen[e[2]] = true table.insert(SkelPartNames, e[2]) end
+    end
+end
+
 local function updateSkeleton()
     if not DrawingAvailable then return end
     local cam = camera()
@@ -2105,6 +2161,20 @@ local function updateSkeleton()
         if not pool then pool = { lines = {} } SkeletonPool[player] = pool end
         local li = 0
         if show then
+            -- v8.1-opt: роль+цвет один раз на игрока (было на каждое из 15 ребер)
+            local sRole = getRole(player)
+            local sColor = roleColor(sRole)
+            -- v8.1-opt: BasePart-ссылки кешируются (было 2x FindFirstChild на ребро)
+            local parts = cache.SkelParts
+            if not parts or cache.SkelPartsFor ~= c then
+                parts = {}
+                for _, nm in ipairs(SkelPartNames) do
+                    local inst = c:FindFirstChild(nm)
+                    parts[nm] = (inst and inst:IsA("BasePart")) and inst or nil
+                end
+                cache.SkelParts = parts
+                cache.SkelPartsFor = c
+            end
             -- v7.0: фейд ESP по дистанции
             if Config.ESPFade and myRoot and cache.HRP then
                 local d = (myRoot.Position - cache.HRP.Position).Magnitude
@@ -2114,9 +2184,9 @@ local function updateSkeleton()
                 end
             end
             for _, e in ipairs(SkelEdges) do
-                local a = c:FindFirstChild(e[1])
-                local b = c:FindFirstChild(e[2])
-                if a and b and a:IsA("BasePart") and b:IsA("BasePart") then
+                local a = parts[e[1]]
+                local b = parts[e[2]]
+                if a and b then
                     local pa, va = cam:WorldToViewportPoint(a.Position)
                     local pb, vb = cam:WorldToViewportPoint(b.Position)
                     if va and vb then
@@ -2129,7 +2199,7 @@ local function updateSkeleton()
                         if ln then
                             ln.From = Vector2.new(pa.X, pa.Y)
                             ln.To = Vector2.new(pb.X, pb.Y)
-                            ln.Color = roleColor(getRole(player))
+                            ln.Color = sColor
                             ln.Thickness = 1.5
                             ln.Transparency = 0.9
                             ln.Visible = true
@@ -2243,22 +2313,28 @@ bind("Scheduler", RunService.Heartbeat, function()
     end
 
     if now - lastESP >= effectiveInterval(Config.ESPInterval) then
+        local tE = os.clock()
         updateESP(now)
         pcall(updateChams)
         pcall(updateSkeleton)
+        Perf.msESP = Perf.msESP * 0.9 + (os.clock() - tE) * 1000 * 0.1
         lastESP = now
     end
 
     if Perf.autoCutObjects then
         -- пропускаем скан объектов при просадке
     elseif now - lastObjects >= effectiveInterval(Config.ObjectInterval) then
+        local tO = os.clock()
         scanObjects(now)
+        Perf.msObj = Perf.msObj * 0.9 + (os.clock() - tO) * 1000 * 0.1
         lastObjects = now
     end
     pcall(updateFarm, now)
 
     if now - lastRadar >= 0.20 then
+        local tR = os.clock()
         updateRadar()
+        Perf.msRadar = Perf.msRadar * 0.9 + (os.clock() - tR) * 1000 * 0.1
         lastRadar = now
     end
 
@@ -2410,7 +2486,9 @@ updateOffscreen = function()
     local vs = cam.ViewportSize
     local center = Vector2.new(vs.X / 2, vs.Y / 2)
     for player, cache in pairs(PlayerCache) do
-        if cache and cache.HRP and alive(player) and roleEnabled(getRole(player)) then
+        -- v8.1-opt: один getRole на игрока (было 2x)
+        local oRole = (cache and cache.HRP and alive(player)) and getRole(player) or nil
+        if oRole and roleEnabled(oRole) then
             local sp, visible = cam:WorldToViewportPoint(cache.HRP.Position)
             local tri = OffscreenPool[player]
             if not visible then
@@ -2430,7 +2508,7 @@ updateOffscreen = function()
                     tri.PointA = tip
                     tri.PointB = tip - dir * 18 + perp * 10
                     tri.PointC = tip - dir * 18 - perp * 10
-                    tri.Color = roleColor(getRole(player))
+                    tri.Color = roleColor(oRole)
                     tri.Filled = true
                     tri.Transparency = 0.9
                     tri.Visible = true
@@ -2450,6 +2528,8 @@ end)
 -- ============================================================
 -- CHAMS (v6.0-final: Highlight-обводка, работает на Delta/мобайле)
 -- ============================================================
+
+local ChamsRole = {} -- v8.1-opt: последняя покрашенная роль
 
 updateChams = function()
     for player, cache in pairs(PlayerCache) do
@@ -2471,15 +2551,24 @@ updateChams = function()
                 h = ok and hl or nil
             end
             if h then
-                pcall(function()
-                    h.FillColor = roleColor(getRole(player))
-                    h.OutlineColor = roleColor(getRole(player))
-                    h.Enabled = true
-                end)
+                -- v8.1-opt: перекрас только при смене роли (был 2x roleColor + записи каждый тик)
+                local role = getRole(player)
+                if ChamsRole[player] ~= role then
+                    ChamsRole[player] = role
+                    local col = roleColor(role)
+                    pcall(function()
+                        h.FillColor = col
+                        h.OutlineColor = col
+                        h.Enabled = true
+                    end)
+                end
             end
         elseif c then
             local h = c:FindFirstChild("CinderChams")
             if h then pcall(function() h:Destroy() end) end
+            ChamsRole[player] = nil
+        else
+            ChamsRole[player] = nil
         end
     end
 end
@@ -3541,5 +3630,9 @@ getgenv().CinderV6_StatusImpl = function()
         Chams = Config.Chams,
         Round = RoundTrack.round,
         Kills = RoundTrack.kills,
+        MsESP = math.floor(Perf.msESP * 100) / 100,
+        MsObj = math.floor(Perf.msObj * 100) / 100,
+        MsRadar = math.floor(Perf.msRadar * 100) / 100,
+        MsAim = math.floor(AimMs.v * 100) / 100,
     }
 end
