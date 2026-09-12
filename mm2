@@ -1,0 +1,2236 @@
+--[[
+    CINDER MM2 HUB v5.0
+    Modular Core / Event-driven / Mobile + AutoPerf
+    Delta / Mobile Edition
+    ------------------------------------------------------------
+    Focus:
+      • Mobile-friendly UI
+      • Low-CPU cached ESP
+      • Role / player cache
+      • Radar
+      • Coin/object visualizer
+      • Performance monitor
+      • Central cleanup
+      • Respawn-safe lifecycle
+      • No mass RemoteEvent interception
+      • No automated attacks against other players
+]]
+
+local RayfieldSource = nil
+pcall(function()
+    RayfieldSource = game:HttpGet("https://sirius.menu/rayfield")
+end)
+assert(RayfieldSource and #RayfieldSource > 100, "Cinder v4.1: не удалось загрузить Rayfield (sirius.menu недоступен)")
+local Rayfield = loadstring(RayfieldSource)()
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+local Stats = game:GetService("Stats")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- ============================================================
+-- CONFIG
+-- ============================================================
+
+getgenv().CinderMMMv5 = getgenv().CinderMMMv5 or getgenv().CinderMMMv4 or getgenv().CinderMMMv3 or {}
+local Config = getgenv().CinderMMMv5
+getgenv().CinderMMMv5 = Config
+getgenv().CinderMMMv4 = Config -- alias для совместимости
+
+local Defaults = {
+    ESP = false,
+    ESPNames = true,
+    ESPTracers = true,
+    ESPDistance = true,
+    ESPHealth = true,
+    ESPUnknown = false,
+    ESPTransparency = 0.55,
+    ESPMaxDistance = 1000,
+
+    ShowMurderer = true,
+    ShowSheriff = true,
+    ShowInnocent = false,
+
+    ObjectESP = false,
+    CoinESP = true,
+
+    Radar = false,
+    RadarRange = 150,
+
+    AimAssist = false,
+    AimFOV = 120,
+    AimSmooth = 0.18,
+    AimPart = "Head",
+    AimWallCheck = false,
+    AimCircle = true,
+    AimMurderer = true,
+    AimSheriff = false,
+    AimInnocent = false,
+
+    WalkSpeedEnabled = false,
+    WalkSpeed = 16,
+    JumpEnabled = false,
+    JumpPower = 50,
+
+    Fly = false,
+    FlySpeed = 50,
+    Noclip = false,
+    InfiniteJump = false,
+    AntiFling = true,
+    AntiAFK = true,
+
+    FullBright = false,
+    NoFog = false,
+    Crosshair = false,
+    CrosshairSize = 8,
+
+    LowCPUMode = true,
+    AutoPerf = true, -- v5: авто-срез качества при низком FPS
+    AutoPerfFPS = 28,
+    ESPInterval = 0.20,
+    RoleInterval = 0.75,
+    ObjectInterval = 1.0,
+    ServerHopProxy = "",
+
+    -- v5 ESP 2.0
+    ESPMode = "Hybrid", -- Hybrid | Billboard | Drawing2D
+    ESPLodDistance = 400, -- дальше: только бокс+имя, без HP/дистанции каждый тик
+    OffscreenArrows = false,
+    TracersMurdererOnly = false,
+
+    -- v5 Aim
+    AimAutoPart = true, -- авто: ближайшая к курсору часть Head/HRP
+    AimPredict = 0, -- 0..1 компенсация движения цели
+    AimFOVMurderer = -1, -- -1 = использовать общий AimFOV
+    AimFOVSheriff = -1,
+    AimFOVInnocent = -1,
+
+    -- v5 Mobile
+    MobileButtons = false,
+
+    Debug = false,
+}
+
+for key, value in pairs(Defaults) do
+    if Config[key] == nil then
+        Config[key] = value
+    end
+end
+
+-- ============================================================
+-- UTIL
+-- ============================================================
+
+local function camera()
+    return workspace.CurrentCamera
+end
+
+local function character()
+    return LocalPlayer.Character
+end
+
+local function humanoid()
+    local c = character()
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function root()
+    local c = character()
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function alive(player)
+    local c = player and player.Character
+    local h = c and c:FindFirstChildOfClass("Humanoid")
+    return h and h.Health > 0
+end
+
+local function safeDestroy(instance)
+    if instance then
+        pcall(function()
+            instance:Destroy()
+        end)
+    end
+end
+
+-- ============================================================
+-- CONNECTION / CLEANUP MANAGER
+-- ============================================================
+
+local Connections = {}
+local CleanupTasks = {}
+local PlayerConnections = {}
+local OriginalMovement = {
+    WalkSpeed = nil,
+    JumpPower = nil,
+}
+local MobileFly = {
+    Up = false,
+    Down = false,
+}
+
+local VisualState = {
+    Lighting = {
+        Brightness = nil,
+        ClockTime = nil,
+        FogEnd = nil,
+        GlobalShadows = nil,
+        Ambient = nil,
+        OutdoorAmbient = nil,
+        SavedFullBright = false,
+        SavedNoFog = false,
+    },
+    FOVCircle = nil,
+    Crosshair = {},
+    Offscreen = {},
+}
+
+-- v4.1 forward declares: shutdown/bindPlayer раньше ссылались на локали ниже (были nil-global).
+
+local function bind(name, signal, callback)
+    if Connections[name] then
+        Connections[name]:Disconnect()
+    end
+    Connections[name] = signal:Connect(callback)
+    return Connections[name]
+end
+
+local function unbind(name)
+    local c = Connections[name]
+    if c then
+        c:Disconnect()
+        Connections[name] = nil
+    end
+end
+
+local function cleanup(name)
+    local taskFn = CleanupTasks[name]
+    if taskFn then
+        pcall(taskFn)
+        CleanupTasks[name] = nil
+    end
+end
+
+local function registerCleanup(name, fn)
+    CleanupTasks[name] = fn
+end
+
+local function restoreMovementStats()
+    local h = humanoid()
+    if not h then return end
+
+    if OriginalMovement.WalkSpeed ~= nil then
+        h.WalkSpeed = OriginalMovement.WalkSpeed
+    end
+
+    if OriginalMovement.JumpPower ~= nil then
+        h.JumpPower = OriginalMovement.JumpPower
+    end
+
+    OriginalMovement.WalkSpeed = nil
+    OriginalMovement.JumpPower = nil
+end
+
+local function shutdown()
+    for name in pairs(Connections) do
+        unbind(name)
+    end
+
+    for player in pairs(PlayerConnections) do
+        clearPlayer(player)
+    end
+
+    for name in pairs(CleanupTasks) do
+        cleanup(name)
+    end
+
+    restoreMovementStats()
+end
+
+-- ============================================================
+-- PLAYER CACHE
+-- ============================================================
+
+local refreshPlayer, clearPlayer, bindPlayer
+local destroyESP, clearESP, clearObjectESP
+local scanCharacter
+
+-- v5 Core: модульная шина событий (Roles/ESP/Aim/Player подписываются сюда)
+local Core = { listeners = {} }
+function Core.on(event, fn)
+    Core.listeners[event] = Core.listeners[event] or {}
+    table.insert(Core.listeners[event], fn)
+end
+function Core.emit(event, ...)
+    local ls = Core.listeners[event]
+    if not ls then return end
+    for _, fn in ipairs(ls) do pcall(fn, ...) end
+end
+
+local PlayerCache = {}
+
+scanCharacter = function(player)
+    local c = player and player.Character
+    if not c then
+        return nil
+    end
+
+    local hrp = c:FindFirstChild("HumanoidRootPart") or c:FindFirstChild("Torso")
+    local old = PlayerCache[player]
+    return {
+        Character = c,
+        Head = c:FindFirstChild("Head"),
+        HRP = hrp,
+        HumanoidRootPart = hrp,
+        Humanoid = c:FindFirstChildOfClass("Humanoid"),
+        LastRole = (old and old.LastRole) or "Unknown",
+        RoleAt = 0,
+        PendingRole = (old and old.PendingRole) or "Unknown",
+        PendingCount = (old and old.PendingCount) or 0,
+        ToolConns = {},
+    }
+end
+
+refreshPlayer = function(player)
+    if player == LocalPlayer then
+        return
+    end
+    PlayerCache[player] = scanCharacter(player)
+end
+
+clearPlayer = function(player)
+    PlayerCache[player] = nil
+
+    local conns = PlayerConnections[player]
+    if conns then
+        for _, connection in ipairs(conns) do
+            pcall(function()
+                connection:Disconnect()
+            end)
+        end
+        PlayerConnections[player] = nil
+    end
+end
+
+bindPlayer = function(player)
+    if player == LocalPlayer then
+        return
+    end
+
+    clearPlayer(player)
+    refreshPlayer(player)
+
+    local conns = {}
+    local cache = PlayerCache[player]
+
+    local function hookTools(char)
+        if not char then return end
+        for _, c in ipairs(cache and cache.ToolConns or {}) do pcall(function() c:Disconnect() end) end
+        if cache then table.clear(cache.ToolConns) end
+        local function fastUpdate()
+            if not PlayerCache[player] then return end
+            local r = detectRole(player)
+            if r ~= "Unknown" then
+                PlayerCache[player].LastRole = r
+                PlayerCache[player].PendingRole = r
+                PlayerCache[player].PendingCount = 2
+                Core.emit("role", player, r)
+            end
+        end
+        table.insert(conns, char.ChildAdded:Connect(function(ch)
+            if ch:IsA("Tool") then task.delay(0.05, fastUpdate) end
+        end))
+        table.insert(conns, char.ChildRemoved:Connect(function(ch)
+            if ch:IsA("Tool") then task.delay(0.05, fastUpdate) end
+        end))
+    end
+    if cache and cache.Character then hookTools(cache.Character) end
+
+    table.insert(conns, player.CharacterAdded:Connect(function(char)
+        task.wait(0.15)
+        refreshPlayer(player)
+        local nc = PlayerCache[player]
+        if nc and nc.Character then hookTools(nc.Character) end
+    end))
+
+    table.insert(conns, player.CharacterRemoving:Connect(function()
+        destroyESP(player)
+        clearPlayer(player)
+    end))
+
+    PlayerConnections[player] = conns
+end
+
+for _, p in ipairs(Players:GetPlayers()) do
+    bindPlayer(p)
+end
+
+-- ============================================================
+-- ROLE PROVIDER
+-- ============================================================
+
+local function normalizeRole(value)
+    if type(value) ~= "string" then
+        return "Unknown"
+    end
+
+    local s = value:lower()
+
+    if s == "murderer" then
+        return "Murderer"
+    elseif s == "sheriff" then
+        return "Sheriff"
+    elseif s == "innocent" then
+        return "Innocent"
+    end
+
+    return "Unknown"
+end
+
+local function detectRole(player)
+    local cache = PlayerCache[player]
+    if not cache then
+        return "Unknown"
+    end
+
+    -- v5 приоритет: 1) GUI Role 2) атрибуты 3) Tool в персонаже 4) Backpack
+    local gui = player:FindFirstChild("PlayerGui")
+    if gui then
+        local main = gui:FindFirstChild("MainGUI")
+        if main then
+            local value = main:FindFirstChild("Role", true)
+            if value and value:IsA("StringValue") then
+                local role = normalizeRole(value.Value)
+                if role ~= "Unknown" then
+                    return role
+                end
+            end
+        end
+    end
+    local okAttr, attrRole = pcall(function()
+        return player:GetAttribute("Role") or (cache.Character and cache.Character:GetAttribute("Role"))
+    end)
+    if okAttr and type(attrRole) == "string" then
+        local role = normalizeRole(attrRole)
+        if role ~= "Unknown" then return role end
+    end
+    local function toolRole(container)
+        if not container then return nil end
+        for _, item in ipairs(container:GetChildren()) do
+            if item:IsA("Tool") then
+                local n = item.Name:lower()
+                if n:find("knife", 1, true) then return "Murderer" end
+                if n:find("gun", 1, true) or n:find("revolver", 1, true) then return "Sheriff" end
+            end
+        end
+        return nil
+    end
+    local c = cache.Character
+    local r1 = toolRole(c)
+    if r1 then return r1 end
+    local bp = player:FindFirstChildOfClass("Backpack")
+    local r2 = toolRole(bp)
+    if r2 then return r2 end
+    return "Unknown"
+end
+
+local function updateRoles(force)
+    local now = os.clock()
+    for player, cache in pairs(PlayerCache) do
+        if cache then
+            if force or now - cache.RoleAt >= effectiveInterval(Config.RoleInterval) then
+                local detected = detectRole(player)
+                -- v5 дебаунс: Unknown не затирает сразу, смена требует 2 подтверждений
+                if detected == "Unknown" then
+                    if cache.LastRole == "Unknown" or force then
+                        cache.LastRole = "Unknown"
+                    end
+                elseif detected == cache.LastRole then
+                    cache.PendingRole = detected
+                    cache.PendingCount = 2
+                elseif detected == cache.PendingRole then
+                    cache.PendingCount = (cache.PendingCount or 0) + 1
+                    if cache.PendingCount >= 2 or force then
+                        if cache.LastRole ~= detected then
+                            cache.LastRole = detected
+                            Core.emit("role", player, detected)
+                        end
+                    end
+                else
+                    cache.PendingRole = detected
+                    cache.PendingCount = 1
+                    if force then
+                        cache.LastRole = detected
+                        Core.emit("role", player, detected)
+                    end
+                end
+                cache.RoleAt = now
+            end
+        end
+    end
+end
+
+local function getRole(player)
+    local cache = PlayerCache[player]
+    return cache and cache.LastRole or "Unknown"
+end
+
+local function roleColor(role)
+    if role == "Murderer" then
+        return Color3.fromRGB(255, 70, 70)
+    elseif role == "Sheriff" then
+        return Color3.fromRGB(80, 130, 255)
+    elseif role == "Innocent" then
+        return Color3.fromRGB(80, 235, 110)
+    end
+    return Color3.fromRGB(220, 220, 220)
+end
+
+local function roleEnabled(role)
+    if role == "Murderer" then return Config.ShowMurderer end
+    if role == "Sheriff" then return Config.ShowSheriff end
+    if role == "Innocent" then return Config.ShowInnocent end
+    return Config.ESPUnknown
+end
+
+-- ============================================================
+-- ESP MANAGER
+-- ============================================================
+
+local ESP = {}
+local DrawingAvailable = type(Drawing) == "table" and type(Drawing.new) == "function"
+
+destroyESP = function(player)
+    local data = ESP[player]
+    if not data then return end
+
+    for _, item in pairs(data.instances) do
+        safeDestroy(item)
+    end
+
+    if data.line then
+        pcall(function()
+            data.line.Visible = false
+            data.line:Remove()
+        end)
+    end
+
+    ESP[player] = nil
+end
+
+clearESP = function()
+    for player in pairs(ESP) do
+        destroyESP(player)
+    end
+end
+
+local function makeESP(player)
+    local cache = PlayerCache[player]
+    local head = cache and cache.Head
+
+    if not head or not head.Parent then
+        return
+    end
+
+    if ESP[player] and ESP[player].head == head then
+        return
+    end
+
+    destroyESP(player)
+
+    local data = {
+        head = head,
+        instances = {},
+        box = nil,
+        billboard = nil,
+        label = nil,
+        health = nil,
+        line = nil,
+    }
+
+    local color = roleColor(getRole(player))
+
+    local box = Instance.new("BoxHandleAdornment")
+    box.Name = "CinderV3Box"
+    box.Adornee = head
+    box.AlwaysOnTop = true
+    box.ZIndex = 5
+    box.Size = Vector3.new(2.5, 4.5, 2.5)
+    box.Transparency = Config.ESPTransparency
+    box.Color3 = color
+    box.Parent = head
+
+    data.box = box
+    table.insert(data.instances, box)
+
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "CinderV3Info"
+    billboard.Adornee = head
+    billboard.AlwaysOnTop = true
+    billboard.Size = UDim2.fromOffset(240, 60)
+    billboard.StudsOffset = Vector3.new(0, 3.5, 0)
+    billboard.Parent = head
+
+    local label = Instance.new("TextLabel")
+    label.BackgroundTransparency = 1
+    label.Size = UDim2.new(1, 0, 0, 34)
+    label.Font = Enum.Font.GothamBold
+    label.TextScaled = true
+    label.TextStrokeTransparency = 0
+    label.TextColor3 = color
+    label.Text = player.Name
+    label.Parent = billboard
+
+    data.billboard = billboard
+    data.label = label
+    table.insert(data.instances, billboard)
+
+    if DrawingAvailable and Config.ESPTracers then
+        local ok, line = pcall(function()
+            return Drawing.new("Line")
+        end)
+
+        if ok and line then
+            line.Thickness = 1.5
+            line.Transparency = 0.9
+            line.Color = color
+            line.Visible = false
+            data.line = line
+        end
+    end
+
+    if Config.ESPHealth then
+        local health = Instance.new("TextLabel")
+        health.BackgroundTransparency = 1
+        health.Position = UDim2.fromOffset(0, 34)
+        health.Size = UDim2.new(1, 0, 0, 22)
+        health.Font = Enum.Font.Gotham
+        health.TextScaled = true
+        health.TextStrokeTransparency = 0.2
+        health.TextColor3 = Color3.fromRGB(240, 240, 240)
+        health.Parent = billboard
+
+        data.health = health
+    end
+
+    ESP[player] = data
+end
+
+local function updateESP(now)
+    if not Config.ESP then
+        if next(ESP) then clearESP() end
+        return
+    end
+
+    local myRoot = root()
+    local cam = camera()
+    for player, cache in pairs(PlayerCache) do
+        if cache and cache.Head and cache.Head.Parent and alive(player) then
+            local withinRange = true
+            if myRoot and cache.HRP then
+                withinRange = (myRoot.Position - cache.HRP.Position).Magnitude <= Config.ESPMaxDistance
+            end
+
+            if not withinRange then
+                destroyESP(player)
+                continue
+            end
+
+            local role = getRole(player)
+
+            if roleEnabled(role) then
+                makeESP(player)
+                local data = ESP[player]
+
+                if data then
+                    local color = roleColor(role)
+
+                    if data.box then
+                        data.box.Color3 = color
+                        data.box.Transparency = Config.ESPTransparency
+                    end
+
+                    local distanceText = ""
+                    if Config.ESPDistance then
+                        if myRoot and cache.HRP then
+                            distanceText = string.format(
+                                " • %dm",
+                                math.floor((myRoot.Position - cache.HRP.Position).Magnitude)
+                            )
+                        end
+                    end
+
+                    if data.label then
+                        if Config.ESPNames then
+                            data.label.Text = player.Name .. " [" .. role .. "]" .. distanceText
+                        else
+                            data.label.Text = role .. distanceText
+                        end
+                        data.label.TextColor3 = color
+                    end
+
+                    -- v5 LOD: далеко — без HP-обновления каждый тик
+                    local dist = myRoot and cache.HRP and (myRoot.Position - cache.HRP.Position).Magnitude or 0
+                    local isFar = dist > Config.ESPLodDistance
+                    if data.health and cache.Humanoid and not isFar then
+                        data.health.Text = string.format(
+                            "HP: %d/%d",
+                            math.floor(cache.Humanoid.Health),
+                            math.floor(cache.Humanoid.MaxHealth)
+                        )
+                    elseif data.health and isFar then
+                        data.health.Text = ""
+                    end
+
+                    if data.line then
+                        local tracerOk = Config.ESPTracers
+                        if tracerOk and Config.TracersMurdererOnly and role ~= "Murderer" then
+                            tracerOk = false
+                        end
+                        if Perf.autoCut and Perf.autoCutTracers then tracerOk = false end
+                        if tracerOk and cam and myRoot and cache.HRP then
+                            local viewport, visible = cam:WorldToViewportPoint(cache.HRP.Position)
+                            if visible and viewport.Z > 0 then
+                                local from = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y)
+                                data.line.From = from
+                                data.line.To = Vector2.new(viewport.X, viewport.Y)
+                                data.line.Color = color
+                                data.line.Visible = true
+                            else
+                                data.line.Visible = false
+                            end
+                        else
+                            data.line.Visible = false
+                        end
+                    end
+                end
+            else
+                destroyESP(player)
+            end
+        else
+            destroyESP(player)
+        end
+    end
+end
+
+-- ============================================================
+-- OBJECT ESP
+-- ============================================================
+
+local ObjectESP = {}
+local ObjectCandidates = {}
+local objectScanAt = 0
+
+clearObjectESP = function()
+    for obj, billboard in pairs(ObjectESP) do
+        safeDestroy(billboard)
+        ObjectESP[obj] = nil
+    end
+end
+
+local function isCoin(obj)
+    return obj:IsA("BasePart") and obj.Name:lower():find("coin", 1, true) ~= nil
+end
+
+local function objectLooksInteresting(obj)
+    if not obj:IsA("BasePart") then
+        return false
+    end
+
+    local name = obj.Name:lower()
+    if name:find("coin", 1, true) then
+        return Config.CoinESP
+    end
+
+    if not Config.ObjectESP then
+        return false
+    end
+
+    return name:find("gun", 1, true)
+        or name:find("knife", 1, true)
+end
+
+local function makeObjectESP(obj)
+    if ObjectESP[obj] or not objectLooksInteresting(obj) then
+        return
+    end
+
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "CinderV3Object"
+    billboard.Adornee = obj
+    billboard.AlwaysOnTop = true
+    billboard.Size = UDim2.fromOffset(140, 28)
+    billboard.StudsOffset = Vector3.new(0, 1.5, 0)
+    billboard.Parent = obj
+
+    local text = Instance.new("TextLabel")
+    text.BackgroundTransparency = 1
+    text.Size = UDim2.fromScale(1, 1)
+    text.Font = Enum.Font.GothamBold
+    text.TextScaled = true
+    text.TextStrokeTransparency = 0
+    text.Text = obj.Name
+    text.TextColor3 = isCoin(obj)
+        and Color3.fromRGB(255, 220, 70)
+        or Color3.fromRGB(230, 230, 230)
+    text.Parent = billboard
+
+    ObjectESP[obj] = billboard
+end
+
+local function scanObjects(now)
+    if not Config.ObjectESP and not Config.CoinESP then
+        if next(ObjectESP) then clearObjectESP() end
+        table.clear(ObjectCandidates)
+        return
+    end
+
+    if now - objectScanAt < effectiveInterval(Config.ObjectInterval) then
+        return
+    end
+    objectScanAt = now
+
+    -- v4.1: сканируем Map/контейнер вместо всего workspace, дешевле на Delta
+    local container = workspace:FindFirstChild("Map") or workspace:FindFirstChild("Coins")
+        or workspace:FindFirstChild("CoinContainer") or workspace
+    local myRoot = root()
+    for _, obj in ipairs(container:GetDescendants()) do
+        if objectLooksInteresting(obj) then
+            if myRoot and obj:IsA("BasePart") then
+                local ok, d = pcall(function()
+                    return (myRoot.Position - obj.Position).Magnitude
+                end)
+                if ok and d and d > Config.ESPMaxDistance then
+                    continue
+                end
+            end
+            ObjectCandidates[obj] = true
+            makeObjectESP(obj)
+        end
+    end
+
+    for obj in pairs(ObjectCandidates) do
+        if not obj.Parent or not objectLooksInteresting(obj) then
+            ObjectCandidates[obj] = nil
+            if ObjectESP[obj] then
+                safeDestroy(ObjectESP[obj])
+                ObjectESP[obj] = nil
+            end
+        end
+    end
+end
+
+bind("ObjectAdded", workspace.DescendantAdded, function(obj)
+    if objectLooksInteresting(obj) then
+        ObjectCandidates[obj] = true
+        if Config.ObjectESP or Config.CoinESP then
+            makeObjectESP(obj)
+        end
+    end
+end)
+
+bind("ObjectRemoved", workspace.DescendantRemoving, function(obj)
+    ObjectCandidates[obj] = nil
+    if ObjectESP[obj] then
+        safeDestroy(ObjectESP[obj])
+        ObjectESP[obj] = nil
+    end
+end)
+
+-- ============================================================
+-- RADAR
+-- ============================================================
+
+local Radar = {}
+local radarGui
+local radarFrame
+
+local function destroyRadar()
+    if radarGui then
+        radarGui:Destroy()
+        radarGui = nil
+        radarFrame = nil
+    end
+    table.clear(Radar)
+end
+
+local function createRadar()
+    if radarGui then return end
+
+    radarGui = Instance.new("ScreenGui")
+    radarGui.Name = "CinderV3Radar"
+    radarGui.ResetOnSpawn = false
+    radarGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+    radarFrame = Instance.new("Frame")
+    radarFrame.AnchorPoint = Vector2.new(1, 0)
+    radarFrame.Position = UDim2.new(1, -18, 0, 90)
+    radarFrame.Size = UDim2.fromOffset(180, 180)
+    radarFrame.BackgroundTransparency = 0.25
+    radarFrame.Parent = radarGui
+
+    local title = Instance.new("TextLabel")
+    title.BackgroundTransparency = 1
+    title.Size = UDim2.new(1, 0, 0, 24)
+    title.Font = Enum.Font.GothamBold
+    title.Text = "CINDER RADAR"
+    title.TextScaled = true
+    title.Parent = radarFrame
+
+    local center = Instance.new("Frame")
+    center.AnchorPoint = Vector2.new(0.5, 0.5)
+    center.Position = UDim2.fromScale(0.5, 0.5)
+    center.Size = UDim2.fromOffset(6, 6)
+    center.Parent = radarFrame
+end
+
+local function updateRadar()
+    if not Config.Radar then
+        destroyRadar()
+        return
+    end
+
+    createRadar()
+
+    local r = root()
+    if not r then return end
+    local seen = {}
+
+    for player, cache in pairs(PlayerCache) do
+        if cache and cache.HRP and cache.HRP.Parent then
+            local delta = cache.HRP.Position - r.Position
+            local flat = Vector3.new(delta.X, 0, delta.Z)
+            local distance = flat.Magnitude
+
+            if distance <= Config.RadarRange then
+                local x = math.clamp(flat.X / Config.RadarRange, -1, 1)
+                local y = math.clamp(flat.Z / Config.RadarRange, -1, 1)
+
+                -- v4.1: переиспользуем доты вместо create/destroy
+                local dot = Radar[player]
+                if not dot or not dot.Parent then
+                    dot = Instance.new("Frame")
+                    dot.AnchorPoint = Vector2.new(0.5, 0.5)
+                    dot.Size = UDim2.fromOffset(8, 8)
+                    dot.BorderSizePixel = 0
+                    dot.Parent = radarFrame
+                    Radar[player] = dot
+                end
+                dot.Position = UDim2.fromScale(0.5 + x * 0.45, 0.5 + y * 0.45)
+                dot.BackgroundColor3 = roleColor(getRole(player))
+                dot.Visible = true
+                seen[player] = true
+            end
+        end
+    end
+
+    for player, dot in pairs(Radar) do
+        if not seen[player] then
+            safeDestroy(dot)
+            Radar[player] = nil
+        end
+    end
+end
+
+-- ============================================================
+-- TARGET / CAMERA AIM ASSIST
+-- ============================================================
+
+local function targetAllowed(role)
+    if role == "Murderer" then return Config.AimMurderer end
+    if role == "Sheriff" then return Config.AimSheriff end
+    if role == "Innocent" then return Config.AimInnocent end
+    return false
+end
+
+local function hasLineOfSight(part)
+    if not Config.AimWallCheck then
+        return true
+    end
+
+    local cam = camera()
+    local localChar = character()
+    if not cam or not localChar or not part then
+        return false
+    end
+
+    local origin = cam.CFrame.Position
+    local direction = part.Position - origin
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {localChar}
+    params.IgnoreWater = true
+
+    local result = workspace:Raycast(origin, direction, params)
+    return result == nil or result.Instance:IsDescendantOf(part.Parent)
+end
+
+local function roleFOV(role)
+    if role == "Murderer" and (Config.AimFOVMurderer or -1) > 0 then return Config.AimFOVMurderer end
+    if role == "Sheriff" and (Config.AimFOVSheriff or -1) > 0 then return Config.AimFOVSheriff end
+    if role == "Innocent" and (Config.AimFOVInnocent or -1) > 0 then return Config.AimFOVInnocent end
+    return Config.AimFOV
+end
+
+local function pickAimPart(cache)
+    if Config.AimAutoPart and cache.Head and cache.HRP then
+        local cam = camera()
+        if cam then
+            local mouse = UserInputService:GetMouseLocation()
+            local hp, hv = cam:WorldToViewportPoint(cache.Head.Position)
+            local rp, rv = cam:WorldToViewportPoint(cache.HRP.Position)
+            if hv and rv then
+                local dh = (Vector2.new(hp.X, hp.Y) - mouse).Magnitude
+                local dr = (Vector2.new(rp.X, rp.Y) - mouse).Magnitude
+                return (dh <= dr) and cache.Head or cache.HRP
+            end
+        end
+        return cache.Head
+    end
+    return cache[Config.AimPart] or cache.Head or cache.HRP
+end
+
+local function closestTarget()
+    local cam = camera()
+    if not cam then return nil end
+
+    local mouse = UserInputService:GetMouseLocation()
+    local best
+    local bestDistance = math.huge
+
+    for player, cache in pairs(PlayerCache) do
+        if cache and cache.Humanoid and cache.Humanoid.Health > 0 then
+            local role = getRole(player)
+            if targetAllowed(role) then
+                local part = pickAimPart(cache)
+                if part then
+                    local point, visible = cam:WorldToViewportPoint(part.Position)
+                    if visible and point.Z > 0 and hasLineOfSight(part) then
+                        local d = (Vector2.new(point.X, point.Y) - mouse).Magnitude
+                        local fov = roleFOV(role)
+                        if d <= fov and d < bestDistance then
+                            bestDistance = d
+                            best = part
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return best
+end
+
+local aimSearchAt = 0
+
+local function updateAimCircle()
+    if not DrawingAvailable then return end
+
+    if not VisualState.FOVCircle then
+        local ok, circle = pcall(function()
+            return Drawing.new("Circle")
+        end)
+        if ok and circle then
+            circle.Filled = false
+            circle.Thickness = 1.5
+            circle.Transparency = 0.8
+            circle.Color = Color3.fromRGB(255, 255, 255)
+            VisualState.FOVCircle = circle
+        end
+    end
+
+    local circle = VisualState.FOVCircle
+    if not circle then return end
+
+    local mouse = UserInputService:GetMouseLocation()
+    circle.Position = mouse
+    circle.Radius = Config.AimFOV
+    circle.Visible = Config.AimAssist and Config.AimCircle
+end
+
+bind("AimAssist", RunService.RenderStepped, function()
+    updateAimCircle()
+    if not Config.AimAssist then return end
+
+    local now = os.clock()
+    if now - aimSearchAt < 1 / 30 then return end
+    aimSearchAt = now
+
+    local target = closestTarget()
+    local cam = camera()
+
+    if target and cam then
+        local alpha = math.clamp(Config.AimSmooth, 0.01, 1)
+        local aimPos = target.Position
+        if (Config.AimPredict or 0) > 0 then
+            local vel = target.AssemblyLinearVelocity
+            if vel and vel.Magnitude < 200 then
+                aimPos = aimPos + vel * math.clamp(Config.AimPredict, 0, 1) * 0.12
+            end
+        end
+        local desired = CFrame.lookAt(cam.CFrame.Position, aimPos)
+        cam.CFrame = cam.CFrame:Lerp(desired, alpha)
+    end
+end)
+
+-- ============================================================
+-- MOVEMENT
+-- ============================================================
+
+local originalCollision = {}
+local noclipParts = {}
+local flyVelocity
+local flyAttachment
+
+local function setMovementStats()
+    local h = humanoid()
+    if not h then return end
+
+    if Config.WalkSpeedEnabled then
+        if OriginalMovement.WalkSpeed == nil then
+            OriginalMovement.WalkSpeed = h.WalkSpeed
+        end
+        h.WalkSpeed = Config.WalkSpeed
+    elseif OriginalMovement.WalkSpeed ~= nil then
+        h.WalkSpeed = OriginalMovement.WalkSpeed
+        OriginalMovement.WalkSpeed = nil
+    end
+
+    if Config.JumpEnabled then
+        if OriginalMovement.JumpPower == nil then
+            OriginalMovement.JumpPower = h.JumpPower
+        end
+        h.JumpPower = Config.JumpPower
+    elseif OriginalMovement.JumpPower ~= nil then
+        h.JumpPower = OriginalMovement.JumpPower
+        OriginalMovement.JumpPower = nil
+    end
+end
+
+local function refreshNoclipCache()
+    table.clear(noclipParts)
+    local c = character()
+    if not c then return end
+    for _, obj in ipairs(c:GetChildren()) do
+        if obj:IsA("BasePart") then
+            table.insert(noclipParts, obj)
+        end
+    end
+end
+
+local function noclipStep()
+    if #noclipParts == 0 then refreshNoclipCache() end
+    for _, obj in ipairs(noclipParts) do
+        if obj and obj.Parent then
+            if Config.Noclip then
+                if originalCollision[obj] == nil then
+                    originalCollision[obj] = obj.CanCollide
+                end
+                obj.CanCollide = false
+            elseif originalCollision[obj] ~= nil then
+                obj.CanCollide = originalCollision[obj]
+                originalCollision[obj] = nil
+            end
+        end
+    end
+end
+
+local function stopFly()
+    unbind("Fly")
+    if flyVelocity then
+        safeDestroy(flyVelocity)
+        flyVelocity = nil
+    end
+    if flyAttachment then
+        safeDestroy(flyAttachment)
+        flyAttachment = nil
+    end
+end
+
+local function startFly()
+    stopFly()
+
+    local c = character()
+    local r = c and c:FindFirstChild("HumanoidRootPart")
+    if not r then return end
+
+    flyAttachment = Instance.new("Attachment")
+    flyAttachment.Name = "CinderFlyAttachment"
+    flyAttachment.Parent = r
+
+    flyVelocity = Instance.new("LinearVelocity")
+    flyVelocity.Name = "CinderFlyVelocity"
+    flyVelocity.Attachment0 = flyAttachment
+    flyVelocity.MaxForce = math.huge
+    flyVelocity.RelativeTo = Enum.ActuatorRelativeTo.World
+    flyVelocity.VectorVelocity = Vector3.zero
+    flyVelocity.Parent = r
+
+    bind("Fly", RunService.RenderStepped, function()
+        if not Config.Fly or LocalPlayer.Character ~= c then
+            stopFly()
+            return
+        end
+
+        local cam = camera()
+        if not cam or not flyVelocity then return end
+
+        local direction = Vector3.zero
+
+        if UserInputService:IsKeyDown(Enum.KeyCode.W) then
+            direction += cam.CFrame.LookVector
+        end
+        if UserInputService:IsKeyDown(Enum.KeyCode.S) then
+            direction -= cam.CFrame.LookVector
+        end
+        if UserInputService:IsKeyDown(Enum.KeyCode.A) then
+            direction -= cam.CFrame.RightVector
+        end
+        if UserInputService:IsKeyDown(Enum.KeyCode.D) then
+            direction += cam.CFrame.RightVector
+        end
+        if UserInputService:IsKeyDown(Enum.KeyCode.Space) or MobileFly.Up then
+            direction += Vector3.yAxis
+        end
+        if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or MobileFly.Down then
+            direction -= Vector3.yAxis
+        end
+
+        flyVelocity.VectorVelocity =
+            direction.Magnitude > 0
+            and direction.Unit * Config.FlySpeed
+            or Vector3.zero
+    end)
+end
+
+-- Infinite Jump
+bind("InfiniteJump", UserInputService.JumpRequest, function()
+    if Config.InfiniteJump then
+        local h = humanoid()
+        if h then
+            h:ChangeState(Enum.HumanoidStateType.Jumping)
+        end
+    end
+end)
+
+-- Anti-Fling
+bind("AntiFling", RunService.Heartbeat, function()
+    if not Config.AntiFling then return end
+
+    local r = root()
+    if not r then return end
+
+    if r.AssemblyLinearVelocity.Magnitude > 150 then
+        r.AssemblyLinearVelocity = Vector3.zero
+        r.AssemblyAngularVelocity = Vector3.zero
+    end
+end)
+
+-- ============================================================
+-- CLIENT VISUALS
+-- ============================================================
+
+local Lighting = game:GetService("Lighting")
+
+local function saveFullBright()
+    local s = VisualState.Lighting
+    if not s.SavedFullBright then
+        s.Brightness = Lighting.Brightness
+        s.ClockTime = Lighting.ClockTime
+        s.GlobalShadows = Lighting.GlobalShadows
+        s.Ambient = Lighting.Ambient
+        s.OutdoorAmbient = Lighting.OutdoorAmbient
+        s.SavedFullBright = true
+    end
+end
+
+local function saveNoFog()
+    local s = VisualState.Lighting
+    if not s.SavedNoFog then
+        s.FogEnd = Lighting.FogEnd
+        s.SavedNoFog = true
+    end
+end
+
+local function restoreLighting()
+    local s = VisualState.Lighting
+    if s.SavedFullBright then
+        Lighting.Brightness = s.Brightness
+        Lighting.ClockTime = s.ClockTime
+        Lighting.GlobalShadows = s.GlobalShadows
+        Lighting.Ambient = s.Ambient
+        Lighting.OutdoorAmbient = s.OutdoorAmbient
+        s.SavedFullBright = false
+    end
+    if s.SavedNoFog then
+        Lighting.FogEnd = s.FogEnd
+        s.SavedNoFog = false
+    end
+end
+
+local function updateClientVisuals()
+    if Config.FullBright then
+        saveFullBright()
+        Lighting.Brightness = 2
+        Lighting.ClockTime = 14
+        Lighting.GlobalShadows = false
+        Lighting.Ambient = Color3.new(1, 1, 1)
+        Lighting.OutdoorAmbient = Color3.new(1, 1, 1)
+    elseif VisualState.Lighting.SavedFullBright and not Config.NoFog then
+        restoreLighting()
+    elseif VisualState.Lighting.SavedFullBright then
+        local s = VisualState.Lighting
+        Lighting.Brightness = s.Brightness
+        Lighting.ClockTime = s.ClockTime
+        Lighting.GlobalShadows = s.GlobalShadows
+        Lighting.Ambient = s.Ambient
+        Lighting.OutdoorAmbient = s.OutdoorAmbient
+        s.SavedFullBright = false
+    end
+
+    if Config.NoFog then
+        saveNoFog()
+        Lighting.FogEnd = 100000
+    elseif VisualState.Lighting.SavedNoFog then
+        Lighting.FogEnd = VisualState.Lighting.FogEnd
+        VisualState.Lighting.SavedNoFog = false
+    end
+end
+
+local function clearDrawingTable(tbl)
+    for key, drawing in pairs(tbl) do
+        pcall(function()
+            drawing.Visible = false
+            drawing:Remove()
+        end)
+        tbl[key] = nil
+    end
+end
+
+local function updateCrosshair()
+    if not DrawingAvailable then return end
+
+    if not Config.Crosshair then
+        clearDrawingTable(VisualState.Crosshair)
+        return
+    end
+
+    if #VisualState.Crosshair == 0 then
+        for _ = 1, 4 do
+            local ok, line = pcall(function()
+                return Drawing.new("Line")
+            end)
+            if ok and line then
+                line.Thickness = 2
+                line.Transparency = 0.9
+                line.Color = Color3.fromRGB(255, 255, 255)
+                table.insert(VisualState.Crosshair, line)
+            end
+        end
+    end
+
+    local cam = camera()
+    if not cam then return end
+
+    local center = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2)
+    local size = math.max(2, Config.CrosshairSize)
+    local gap = 3
+
+    local positions = {
+        {Vector2.new(center.X - gap - size, center.Y), Vector2.new(center.X - gap, center.Y)},
+        {Vector2.new(center.X + gap, center.Y), Vector2.new(center.X + gap + size, center.Y)},
+        {Vector2.new(center.X, center.Y - gap - size), Vector2.new(center.X, center.Y - gap)},
+        {Vector2.new(center.X, center.Y + gap), Vector2.new(center.X, center.Y + gap + size)},
+    }
+
+    for i, line in ipairs(VisualState.Crosshair) do
+        line.From = positions[i][1]
+        line.To = positions[i][2]
+        line.Visible = true
+    end
+end
+
+registerCleanup("ClientVisuals", function()
+    restoreLighting()
+    clearDrawingTable(VisualState.Crosshair)
+    if VisualState.FOVCircle then
+        pcall(function() VisualState.FOVCircle:Remove() end)
+        VisualState.FOVCircle = nil
+    end
+end)
+
+-- ============================================================
+-- PERFORMANCE MANAGER
+-- ============================================================
+
+local Perf = {
+    fps = 60,
+    frameCount = 0,
+    last = os.clock(),
+    interval = 1,
+    autoCut = false,
+    autoCutTracers = false,
+    autoCutObjects = false,
+}
+
+bind("Performance", RunService.RenderStepped, function()
+    Perf.frameCount += 1
+
+    local now = os.clock()
+    local elapsed = now - Perf.last
+
+    if elapsed >= 1 then
+        Perf.fps = math.floor(Perf.frameCount / elapsed)
+        Perf.frameCount = 0
+        Perf.last = now
+        -- v5 AutoPerf: при просадке режем трейсеры/объекты автоматически
+        if Config.AutoPerf then
+            local low = Perf.fps < (Config.AutoPerfFPS or 28)
+            Perf.autoCut = low
+            Perf.autoCutTracers = low
+            Perf.autoCutObjects = low and Perf.fps < ((Config.AutoPerfFPS or 28) - 5)
+        else
+            Perf.autoCut = false
+            Perf.autoCutTracers = false
+            Perf.autoCutObjects = false
+        end
+    end
+end)
+
+local function effectiveInterval(base)
+    if not Config.LowCPUMode then
+        return base
+    end
+
+    if Perf.fps < 30 then
+        return base * 2.5
+    elseif Perf.fps < 45 then
+        return base * 1.5
+    end
+
+    return base
+end
+
+-- ============================================================
+-- SERVER HOP
+-- ============================================================
+
+local function serverHop()
+    local baseUrl = string.format(
+        "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100",
+        game.PlaceId
+    )
+    local url = baseUrl
+    if type(Config.ServerHopProxy) == "string" and #Config.ServerHopProxy > 8 then
+        url = string.format(Config.ServerHopProxy, baseUrl)
+    end
+
+    local ok, response = pcall(function()
+        return game:HttpGet(url)
+    end)
+
+    if not ok then
+        Rayfield:Notify({
+            Title = "Server Hop",
+            Content = "Не удалось получить список серверов.",
+            Duration = 3,
+        })
+        return
+    end
+
+    local decoded, data = pcall(function()
+        return HttpService:JSONDecode(response)
+    end)
+
+    if not decoded or type(data) ~= "table" then
+        Rayfield:Notify({ Title = "Server Hop", Content = "Ошибка парсинга ответа.", Duration = 3 })
+        return
+    end
+
+    for _, server in ipairs(data.data or {}) do
+        if server.id ~= game.JobId
+            and server.playing
+            and server.maxPlayers
+            and server.playing < server.maxPlayers then
+
+            pcall(function()
+                TeleportService:TeleportToPlaceInstance(
+                    game.PlaceId,
+                    server.id,
+                    LocalPlayer
+                )
+            end)
+
+            return
+        end
+    end
+
+    Rayfield:Notify({
+        Title = "Server Hop",
+        Content = "Свободный сервер не найден.",
+        Duration = 3,
+    })
+end
+
+-- ============================================================
+-- UPDATE SCHEDULER
+-- ============================================================
+
+local lastESP = 0
+local lastObjects = 0
+local lastRadar = 0
+local lastRoles = 0
+
+bind("Scheduler", RunService.Heartbeat, function()
+    local now = os.clock()
+
+    if now - lastRoles >= effectiveInterval(Config.RoleInterval) then
+        updateRoles(false)
+        lastRoles = now
+    end
+
+    if now - lastESP >= effectiveInterval(Config.ESPInterval) then
+        updateESP(now)
+        lastESP = now
+    end
+
+    if Perf.autoCutObjects then
+        -- v5: при сильной просадке пропускаем тяжёлый скан объектов
+    elseif now - lastObjects >= effectiveInterval(Config.ObjectInterval) then
+        scanObjects(now)
+        lastObjects = now
+    end
+
+    if now - lastRadar >= 0.20 then
+        updateRadar()
+        lastRadar = now
+    end
+
+    setMovementStats()
+    noclipStep()
+    updateClientVisuals()
+    updateCrosshair()
+    if now - (Perf._offAt or 0) >= 0.3 then
+        Perf._offAt = now
+        pcall(updateOffscreen)
+    end
+end)
+
+-- ============================================================
+-- UI
+-- ============================================================
+
+-- v5 Notify queue: не спамим, складываем в очередь
+local NotifyQueue = {}
+local notifyBusy = false
+local function notify(title, content, duration)
+    table.insert(NotifyQueue, {title = title, content = content, duration = duration or 3})
+    if notifyBusy then return end
+    notifyBusy = true
+    task.spawn(function()
+        while #NotifyQueue > 0 do
+            local n = table.remove(NotifyQueue, 1)
+            pcall(function() Rayfield:Notify({Title = n.title, Content = n.content, Duration = n.duration}) end)
+            task.wait(0.6)
+        end
+        notifyBusy = false
+    end)
+end
+
+-- v5 Mobile touch buttons (Fly Up/Down + IJ toggle)
+local MobileGui
+local function setMobileButtons(v)
+    Config.MobileButtons = v
+    if not v then
+        if MobileGui then pcall(function() MobileGui:Destroy() end) MobileGui = nil end
+        return
+    end
+    if MobileGui then return end
+    local pg = LocalPlayer:WaitForChild("PlayerGui")
+    MobileGui = Instance.new("ScreenGui")
+    MobileGui.Name = "CinderV5Mobile"
+    MobileGui.ResetOnSpawn = false
+    MobileGui.Parent = pg
+    local function mkBtn(text, pos, cb)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.fromOffset(64, 64)
+        b.Position = pos
+        b.Text = text
+        b.Font = Enum.Font.GothamBold
+        b.TextScaled = true
+        b.BackgroundTransparency = 0.3
+        b.Parent = MobileGui
+        b.MouseButton1Click:Connect(cb)
+        return b
+    end
+    mkBtn("UP", UDim2.new(1, -160, 1, -260), function() MobileFly.Up = not MobileFly.Up MobileFly.Down = false end)
+    mkBtn("DN", UDim2.new(1, -80, 1, -260), function() MobileFly.Down = not MobileFly.Down MobileFly.Up = false end)
+    mkBtn("IJ", UDim2.new(1, -80, 1, -180), function() Config.InfiniteJump = not Config.InfiniteJump end)
+end
+registerCleanup("MobileGui", function()
+    if MobileGui then pcall(function() MobileGui:Destroy() end) MobileGui = nil end
+end)
+
+-- v5 Offscreen arrows (Drawing triangles для целей за экраном)
+local OffscreenPool = {}
+local function updateOffscreen()
+    if not DrawingAvailable then return end
+    if not Config.OffscreenArrows or not Config.ESP then
+        for _, d in pairs(OffscreenPool) do pcall(function() d.Visible = false end) end
+        return
+    end
+    local cam = camera()
+    if not cam then return end
+    for player, cache in pairs(PlayerCache) do
+        if cache and cache.HRP and alive(player) and roleEnabled(getRole(player)) then
+            local _, visible = cam:WorldToViewportPoint(cache.HRP.Position)
+            local tri = OffscreenPool[player]
+            if not visible then
+                if not tri then
+                    local ok, t2 = pcall(function() return Drawing.new("Triangle") end)
+                    if ok and t2 then OffscreenPool[player] = t2 tri = t2 end
+                end
+                if tri then
+                    local c = cam.ViewportSize / 2
+                    tri.PointA = c + Vector2.new(0, -14)
+                    tri.PointB = c + Vector2.new(-10, 10)
+                    tri.PointC = c + Vector2.new(10, 10)
+                    tri.Color = roleColor(getRole(player))
+                    tri.Visible = true
+                end
+            elseif tri then
+                tri.Visible = false
+            end
+        elseif OffscreenPool[player] then
+            OffscreenPool[player].Visible = false
+        end
+    end
+end
+registerCleanup("Offscreen", function()
+    for k, d in pairs(OffscreenPool) do pcall(function() d:Remove() end) OffscreenPool[k] = nil end
+end)
+
+-- v5 Presets + Export/Import
+local function applyPreset(name)
+    if name == "MaxFPS" then
+        Config.ESPInterval, Config.RoleInterval, Config.ObjectInterval = 0.35, 1.0, 2.0
+        Config.ESPTracers, Config.ObjectESP, Config.Radar = false, false, false
+        Config.LowCPUMode, Config.AutoPerf = true, true
+    elseif name == "Balanced" then
+        Config.ESPInterval, Config.RoleInterval, Config.ObjectInterval = 0.2, 0.75, 1.0
+        Config.LowCPUMode, Config.AutoPerf = true, true
+    elseif name == "Quality" then
+        Config.ESPInterval, Config.RoleInterval, Config.ObjectInterval = 0.12, 0.5, 0.7
+        Config.LowCPUMode, Config.AutoPerf = false, false
+    end
+    notify("Cinder v5", "Пресет: " .. name, 2)
+end
+local function exportConfig()
+    local ok, json = pcall(function() return HttpService:JSONEncode(Config) end)
+    if not ok then return end
+    pcall(function() if setclipboard then setclipboard(json) end end)
+    getgenv().CinderV5Export = json
+    notify("Cinder v5", "Конфиг скопирован (и в getgenv.CinderV5Export)", 3)
+end
+local function importConfig(json)
+    local ok, data = pcall(function() return HttpService:JSONDecode(json) end)
+    if not ok or type(data) ~= "table" then notify("Cinder v5", "Импорт: битый JSON", 3) return end
+    for k, v in pairs(data) do Config[k] = v end
+    notify("Cinder v5", "Конфиг импортирован", 3)
+end
+getgenv().CinderV5_Export = exportConfig
+getgenv().CinderV5_Import = importConfig
+getgenv().CinderV5_Preset = applyPreset
+
+local Window = Rayfield:CreateWindow({
+    Name = "Cinder MM2 v5.0",
+    LoadingTitle = "Cinder MM2 Hub",
+    LoadingSubtitle = "v5 Modular / Mobile / AutoPerf",
+    ConfigurationSaving = {
+        Enabled = true,
+        FolderName = "CinderMM2",
+        FileName = "ConfigV5",
+    },
+    KeySystem = false,
+})
+
+local visualTab = Window:CreateTab("Visuals", nil)
+
+visualTab:CreateToggle({
+    Name = "ESP",
+    CurrentValue = Config.ESP,
+    Flag = "ESP",
+    Callback = function(v)
+        Config.ESP = v
+        if not v then clearESP() end
+    end,
+})
+
+visualTab:CreateToggle({
+    Name = "Names",
+    CurrentValue = Config.ESPNames,
+    Flag = "ESPNames",
+    Callback = function(v)
+        Config.ESPNames = v
+    end,
+})
+
+visualTab:CreateToggle({
+    Name = "Tracers",
+    CurrentValue = Config.ESPTracers,
+    Flag = "ESPTracers",
+    Callback = function(v)
+        Config.ESPTracers = v
+    end,
+})
+
+visualTab:CreateToggle({
+    Name = "Distance",
+    CurrentValue = Config.ESPDistance,
+    Flag = "ESPDistance",
+    Callback = function(v)
+        Config.ESPDistance = v
+    end,
+})
+
+visualTab:CreateToggle({
+    Name = "Health",
+    CurrentValue = Config.ESPHealth,
+    Flag = "ESPHealth",
+    Callback = function(v)
+        Config.ESPHealth = v
+    end,
+})
+
+visualTab:CreateSlider({
+    Name = "ESP Transparency",
+    Range = {0, 1},
+    Increment = 0.05,
+    CurrentValue = Config.ESPTransparency,
+    Flag = "ESPTransparency",
+    Callback = function(v)
+        Config.ESPTransparency = v
+    end,
+})
+
+visualTab:CreateToggle({
+    Name = "Murderer",
+    CurrentValue = Config.ShowMurderer,
+    Flag = "ShowMurderer",
+    Callback = function(v)
+        Config.ShowMurderer = v
+    end,
+})
+
+visualTab:CreateToggle({
+    Name = "Sheriff",
+    CurrentValue = Config.ShowSheriff,
+    Flag = "ShowSheriff",
+    Callback = function(v)
+        Config.ShowSheriff = v
+    end,
+})
+
+visualTab:CreateToggle({
+    Name = "Innocent",
+    CurrentValue = Config.ShowInnocent,
+    Flag = "ShowInnocent",
+    Callback = function(v)
+        Config.ShowInnocent = v
+    end,
+})
+
+local aimTab = Window:CreateTab("Aim", nil)
+
+aimTab:CreateToggle({
+    Name = "Aim Assist",
+    CurrentValue = Config.AimAssist,
+    Flag = "AimAssist",
+    Callback = function(v)
+        Config.AimAssist = v
+    end,
+})
+
+aimTab:CreateSlider({
+    Name = "FOV",
+    Range = {20, 360},
+    Increment = 5,
+    CurrentValue = Config.AimFOV,
+    Flag = "AimFOV",
+    Callback = function(v)
+        Config.AimFOV = v
+    end,
+})
+
+aimTab:CreateToggle({
+    Name = "FOV Circle",
+    CurrentValue = Config.AimCircle,
+    Flag = "AimCircle",
+    Callback = function(v)
+        Config.AimCircle = v
+    end,
+})
+
+aimTab:CreateToggle({
+    Name = "Wall Check",
+    CurrentValue = Config.AimWallCheck,
+    Flag = "AimWallCheck",
+    Callback = function(v)
+        Config.AimWallCheck = v
+    end,
+})
+
+aimTab:CreateDropdown({
+    Name = "Target Part",
+    Options = {"Head", "HumanoidRootPart"},
+    CurrentOption = {Config.AimPart},
+    MultipleOptions = false,
+    Flag = "AimPart",
+    Callback = function(v)
+        Config.AimPart = type(v) == "table" and v[1] or v
+    end,
+})
+
+aimTab:CreateToggle({
+    Name = "Murderer Target",
+    CurrentValue = Config.AimMurderer,
+    Flag = "AimMurderer",
+    Callback = function(v) Config.AimMurderer = v end,
+})
+
+aimTab:CreateToggle({
+    Name = "Sheriff Target",
+    CurrentValue = Config.AimSheriff,
+    Flag = "AimSheriff",
+    Callback = function(v) Config.AimSheriff = v end,
+})
+
+aimTab:CreateToggle({
+    Name = "Innocent Target",
+    CurrentValue = Config.AimInnocent,
+    Flag = "AimInnocent",
+    Callback = function(v) Config.AimInnocent = v end,
+})
+
+aimTab:CreateSlider({
+    Name = "Smooth",
+    Range = {0.01, 1},
+    Increment = 0.01,
+    CurrentValue = Config.AimSmooth,
+    Flag = "AimSmooth",
+    Callback = function(v)
+        Config.AimSmooth = v
+    end,
+})
+
+local mapTab = Window:CreateTab("Map", nil)
+
+mapTab:CreateToggle({
+    Name = "Object ESP",
+    CurrentValue = Config.ObjectESP,
+    Flag = "ObjectESP",
+    Callback = function(v)
+        Config.ObjectESP = v
+        if not v and not Config.CoinESP then clearObjectESP() end
+    end,
+})
+
+mapTab:CreateToggle({
+    Name = "Coin ESP",
+    CurrentValue = Config.CoinESP,
+    Flag = "CoinESP",
+    Callback = function(v)
+        Config.CoinESP = v
+        if not v and not Config.ObjectESP then
+            clearObjectESP()
+        end
+    end,
+})
+
+mapTab:CreateToggle({
+    Name = "Radar",
+    CurrentValue = Config.Radar,
+    Flag = "Radar",
+    Callback = function(v)
+        Config.Radar = v
+        if not v then destroyRadar() end
+    end,
+})
+
+mapTab:CreateSlider({
+    Name = "Radar Range",
+    Range = {50, 500},
+    Increment = 10,
+    CurrentValue = Config.RadarRange,
+    Flag = "RadarRange",
+    Callback = function(v)
+        Config.RadarRange = v
+    end,
+})
+
+visualTab:CreateSlider({
+    Name = "Max ESP Distance",
+    Range = {100, 3000},
+    Increment = 50,
+    CurrentValue = Config.ESPMaxDistance,
+    Flag = "ESPMaxDistance",
+    Callback = function(v)
+        Config.ESPMaxDistance = v
+    end,
+})
+
+visualTab:CreateToggle({
+    Name = "FullBright",
+    CurrentValue = Config.FullBright,
+    Flag = "FullBright",
+    Callback = function(v)
+        Config.FullBright = v
+        if not v and not Config.NoFog then restoreLighting() end
+    end,
+})
+
+visualTab:CreateToggle({
+    Name = "No Fog",
+    CurrentValue = Config.NoFog,
+    Flag = "NoFog",
+    Callback = function(v)
+        Config.NoFog = v
+        if not v and not Config.FullBright then restoreLighting() end
+    end,
+})
+
+visualTab:CreateToggle({
+    Name = "Crosshair",
+    CurrentValue = Config.Crosshair,
+    Flag = "Crosshair",
+    Callback = function(v)
+        Config.Crosshair = v
+        if not v then clearDrawingTable(VisualState.Crosshair) end
+    end,
+})
+
+visualTab:CreateSlider({
+    Name = "Crosshair Size",
+    Range = {2, 20},
+    Increment = 1,
+    CurrentValue = Config.CrosshairSize,
+    Flag = "CrosshairSize",
+    Callback = function(v)
+        Config.CrosshairSize = v
+    end,
+})
+
+local playerTab = Window:CreateTab("Player", nil)
+
+playerTab:CreateToggle({
+    Name = "WalkSpeed",
+    CurrentValue = Config.WalkSpeedEnabled,
+    Flag = "WalkSpeedEnabled",
+    Callback = function(v)
+        Config.WalkSpeedEnabled = v
+    end,
+})
+
+playerTab:CreateSlider({
+    Name = "WalkSpeed Value",
+    Range = {8, 100},
+    Increment = 1,
+    CurrentValue = Config.WalkSpeed,
+    Flag = "WalkSpeed",
+    Callback = function(v)
+        Config.WalkSpeed = v
+    end,
+})
+
+playerTab:CreateToggle({
+    Name = "JumpPower",
+    CurrentValue = Config.JumpEnabled,
+    Flag = "JumpEnabled",
+    Callback = function(v)
+        Config.JumpEnabled = v
+    end,
+})
+
+playerTab:CreateSlider({
+    Name = "JumpPower Value",
+    Range = {25, 150},
+    Increment = 5,
+    CurrentValue = Config.JumpPower,
+    Flag = "JumpPower",
+    Callback = function(v)
+        Config.JumpPower = v
+    end,
+})
+
+playerTab:CreateToggle({
+    Name = "Fly",
+    CurrentValue = Config.Fly,
+    Flag = "Fly",
+    Callback = function(v)
+        Config.Fly = v
+        if v then startFly() else stopFly() end
+    end,
+})
+
+playerTab:CreateButton({
+    Name = "Fly Up (Mobile)",
+    Callback = function()
+        MobileFly.Up = not MobileFly.Up
+        MobileFly.Down = false
+    end,
+})
+
+playerTab:CreateButton({
+    Name = "Fly Down (Mobile)",
+    Callback = function()
+        MobileFly.Down = not MobileFly.Down
+        MobileFly.Up = false
+    end,
+})
+
+playerTab:CreateSlider({
+    Name = "Fly Speed",
+    Range = {10, 150},
+    Increment = 5,
+    CurrentValue = Config.FlySpeed,
+    Flag = "FlySpeed",
+    Callback = function(v)
+        Config.FlySpeed = v
+    end,
+})
+
+playerTab:CreateToggle({
+    Name = "Noclip",
+    CurrentValue = Config.Noclip,
+    Flag = "Noclip",
+    Callback = function(v)
+        Config.Noclip = v
+        if not v then noclipStep() end
+    end,
+})
+
+playerTab:CreateToggle({
+    Name = "Infinite Jump",
+    CurrentValue = Config.InfiniteJump,
+    Flag = "InfiniteJump",
+    Callback = function(v)
+        Config.InfiniteJump = v
+    end,
+})
+
+playerTab:CreateToggle({
+    Name = "Anti-Fling",
+    CurrentValue = Config.AntiFling,
+    Flag = "AntiFling",
+    Callback = function(v)
+        Config.AntiFling = v
+    end,
+})
+
+local performanceTab = Window:CreateTab("Performance", nil)
+
+performanceTab:CreateToggle({
+    Name = "Low CPU Mode",
+    CurrentValue = Config.LowCPUMode,
+    Flag = "LowCPUMode",
+    Callback = function(v)
+        Config.LowCPUMode = v
+    end,
+})
+
+performanceTab:CreateToggle({
+    Name = "Debug",
+    CurrentValue = Config.Debug,
+    Flag = "Debug",
+    Callback = function(v)
+        Config.Debug = v
+    end,
+})
+
+performanceTab:CreateButton({
+    Name = "Refresh Player Cache",
+    Callback = function()
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer then
+                refreshPlayer(p)
+            end
+        end
+        updateRoles(true)
+
+        Rayfield:Notify({
+            Title = "Cinder",
+            Content = "Кэш игроков обновлён.",
+            Duration = 2,
+        })
+    end,
+})
+
+performanceTab:CreateButton({
+    Name = "Restore Client Visuals",
+    Callback = function()
+        Config.FullBright = false
+        Config.NoFog = false
+        Config.Crosshair = false
+        restoreLighting()
+        clearDrawingTable(VisualState.Crosshair)
+        if VisualState.FOVCircle then
+            VisualState.FOVCircle.Visible = false
+        end
+        Rayfield:Notify({
+            Title = "Cinder",
+            Content = "Клиентские визуальные настройки восстановлены.",
+            Duration = 2,
+        })
+    end,
+})
+
+performanceTab:CreateButton({
+    Name = "Unload / Cleanup",
+    Callback = function()
+        shutdown()
+        if Rayfield.Destroy then
+            pcall(function() Rayfield:Destroy() end)
+        end
+    end,
+})
+
+performanceTab:CreateButton({
+    Name = "Clear Visuals",
+    Callback = function()
+        clearESP()
+        clearObjectESP()
+        destroyRadar()
+        clearDrawingTable(VisualState.Crosshair)
+        if VisualState.FOVCircle then
+            VisualState.FOVCircle.Visible = false
+        end
+    end,
+})
+
+local serverTab = Window:CreateTab("Server", nil)
+
+serverTab:CreateButton({
+    Name = "Server Hop",
+    Callback = serverHop,
+})
+
+serverTab:CreateButton({
+    Name = "Rejoin",
+    Callback = function()
+        pcall(function()
+            TeleportService:Teleport(game.PlaceId, LocalPlayer)
+        end)
+    end,
+})
+
+-- v5 UI: ESP2.0 / Aim / Perf / Mobile / Config в одном табе
+local v5Tab = Window:CreateTab("V5", nil)
+v5Tab:CreateToggle({ Name = "AutoPerf (авто-срез)", CurrentValue = Config.AutoPerf, Flag = "AutoPerf", Callback = function(v) Config.AutoPerf = v end })
+v5Tab:CreateToggle({ Name = "Tracers: только Murderer", CurrentValue = Config.TracersMurdererOnly or false, Flag = "TracersMurdererOnly", Callback = function(v) Config.TracersMurdererOnly = v end })
+v5Tab:CreateToggle({ Name = "Offscreen Arrows", CurrentValue = Config.OffscreenArrows, Flag = "OffscreenArrows", Callback = function(v) Config.OffscreenArrows = v end })
+v5Tab:CreateSlider({ Name = "ESP LOD distance", Range = {100, 2000}, Increment = 25, CurrentValue = Config.ESPLodDistance, Flag = "ESPLodDistance", Callback = function(v) Config.ESPLodDistance = v end })
+v5Tab:CreateToggle({ Name = "Aim AutoPart (Head/HRP)", CurrentValue = Config.AimAutoPart, Flag = "AimAutoPart", Callback = function(v) Config.AimAutoPart = v end })
+v5Tab:CreateSlider({ Name = "Aim Predict", Range = {0, 1}, Increment = 0.05, CurrentValue = Config.AimPredict, Flag = "AimPredict", Callback = function(v) Config.AimPredict = v end })
+v5Tab:CreateSlider({ Name = "FOV Murderer (-1=общий)", Range = {-1, 360}, Increment = 5, CurrentValue = Config.AimFOVMurderer, Flag = "AimFOVMurderer", Callback = function(v) Config.AimFOVMurderer = v end })
+v5Tab:CreateSlider({ Name = "FOV Sheriff (-1=общий)", Range = {-1, 360}, Increment = 5, CurrentValue = Config.AimFOVSheriff, Flag = "AimFOVSheriff", Callback = function(v) Config.AimFOVSheriff = v end })
+v5Tab:CreateToggle({ Name = "Mobile Buttons", CurrentValue = Config.MobileButtons, Flag = "MobileButtons", Callback = function(v) setMobileButtons(v) end })
+v5Tab:CreateButton({ Name = "Preset: MaxFPS", Callback = function() applyPreset("MaxFPS") end })
+v5Tab:CreateButton({ Name = "Preset: Balanced", Callback = function() applyPreset("Balanced") end })
+v5Tab:CreateButton({ Name = "Preset: Quality", Callback = function() applyPreset("Quality") end })
+v5Tab:CreateButton({ Name = "Export Config (clipboard)", Callback = exportConfig })
+if Config.MobileButtons then setMobileButtons(true) end
+
+-- ============================================================
+-- MOBILE / RESPAWN
+-- ============================================================
+
+bind("LocalCharacter", LocalPlayer.CharacterAdded, function()
+    stopFly()
+    MobileFly.Up = false
+    MobileFly.Down = false
+    table.clear(originalCollision)
+    table.clear(noclipParts)
+    refreshNoclipCache()
+    OriginalMovement.WalkSpeed = nil
+    OriginalMovement.JumpPower = nil
+
+    task.wait(0.4)
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then
+            refreshPlayer(p)
+        end
+    end
+
+    if Config.Fly then
+        task.wait(0.2)
+        startFly()
+    end
+end)
+
+bind("PlayerAdded", Players.PlayerAdded, bindPlayer)
+
+bind("PlayerRemoving", Players.PlayerRemoving, function(player)
+    destroyESP(player)
+    clearPlayer(player)
+end)
+
+-- Cleanup when this script instance is replaced.
+registerCleanup("ESP", clearESP)
+registerCleanup("Objects", clearObjectESP)
+registerCleanup("Radar", destroyRadar)
+registerCleanup("Fly", stopFly)
+registerCleanup("Movement", function()
+    Config.WalkSpeedEnabled = false
+    Config.JumpEnabled = false
+    restoreMovementStats()
+end)
+registerCleanup("PlayerConnections", function()
+    for player in pairs(PlayerConnections) do
+        clearPlayer(player)
+    end
+end)
+
+notify("Cinder MM2 v5.0", string.format("Modular Core • FPS %d • AutoPerf %s", Perf.fps, Config.AutoPerf and "ON" or "OFF"), 4)
+
+-- Public diagnostic helper for debugging.
+getgenv().CinderV5_Status = function()
+    return getgenv().CinderMMMv4_Status()
+end
+getgenv().CinderMMMv41_Status = getgenv().CinderMMMv41_Status or nil
+getgenv().CinderMMMv4_Status = function()
+    local players = 0
+    for _ in pairs(PlayerCache) do players += 1 end
+    local pingMs = nil
+    pcall(function()
+        pingMs = Stats.Network.ServerStatsItem["Data Ping"]:GetValueString()
+    end)
+
+    return {
+        Version = "5.0",
+        FPS = Perf.fps,
+        CachedPlayers = players,
+        ESPObjects = (function()
+            local n = 0
+            for _ in pairs(ESP) do n += 1 end
+            return n
+        end)(),
+        ObjectESPObjects = (function()
+            local n = 0
+            for _ in pairs(ObjectESP) do n += 1 end
+            return n
+        end)(),
+        Radar = Config.Radar,
+        AimAssist = Config.AimAssist,
+        FullBright = Config.FullBright,
+        NoFog = Config.NoFog,
+        LowCPUMode = Config.LowCPUMode,
+        Ping = pingMs,
+        NoclipCached = #noclipParts,
+    }
+end
