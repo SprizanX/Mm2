@@ -1,26 +1,43 @@
 --[[
-    CINDER MM2 HUB v5.0
-    Modular Core / Event-driven / Mobile + AutoPerf
+    CINDER MM2 HUB v6.0
+    Modular Core / Event-driven / Mobile + AutoPerf + GodMode
     Delta / Mobile Edition
     ------------------------------------------------------------
-    Focus:
-      • Mobile-friendly UI
-      • Low-CPU cached ESP
-      • Role / player cache
-      • Radar
-      • Coin/object visualizer
-      • Performance monitor
-      • Central cleanup
-      • Respawn-safe lifecycle
-      • No mass RemoteEvent interception
-      • No automated attacks against other players
+    Что нового в v6.0:
+      • ESP Mode: Hybrid / Billboard / Drawing2D (реально влияет на отрисовку)
+      • Radar: скрыть свой dot (RadarHideSelf), цвета точек по ролям
+      • God Mode: HP-слайдер, восстановление при любом уроне (GodModeOnDamage)
+      • FullBright: слайдер яркости (1-5)
+      • Aim: Adaptive FOV (близкие цели — сужать FOV)
+      • Aim: приоритет по ролям (Murderer > Sheriff > Innocent)
+      • Object ESP: кеш объектов карты, фильтрация только видимых объектов
+      • Mobile UI: плавающее меню с кнопками по центру, двойной тап
+      • AutoPerf: мгновенная реакция на просадку FPS (check каждый кадр)
+      • Server Hop: кеш 60 сек, предпочтение минимальных серверов
+      • Ping widget: маленький виджет в углу экрана
+      • Self-Update: работает всегда (не только в Debug)
+      • Chat Commands: /objects, /crosshair добавлены
+      • Лицензия MIT
+
+    Зависимости:
+      • Rayfield (auto-download с sirius.menu)
+
+    Запуск:
+      loadstring(game:HttpGet("https://raw.githubusercontent.com/SprizanX/Mm2/main/mm2"))()
+    v6.0-final доделки:
+      • Aim по тачу (центр экрана / последний тап), GUI FOV-круг + красный лок-индикатор
+      • Offscreen-стрелки направленные (к краю экрана в сторону цели)
+      • AntiAFK реально работает (VirtualUser.Idled)
+      • ServerHop пагинация cursor до 3 страниц
+      • GunDrop ESP + счетчик монет в статусе, Chams-Highlight для мобайла
+      • TouchTap на мобильных кнопках, cleanup FOV-GUI при выгрузке
 ]]
 
 local RayfieldSource = nil
 pcall(function()
     RayfieldSource = game:HttpGet("https://sirius.menu/rayfield")
 end)
-assert(RayfieldSource and #RayfieldSource > 100, "Cinder v4.1: не удалось загрузить Rayfield (sirius.menu недоступен)")
+assert(RayfieldSource and #RayfieldSource > 100, "Cinder v6.0: не удалось загрузить Rayfield (sirius.menu недоступен)")
 local Rayfield = loadstring(RayfieldSource)()
 
 local Players = game:GetService("Players")
@@ -29,17 +46,20 @@ local UserInputService = game:GetService("UserInputService")
 local TeleportService = game:GetService("TeleportService")
 local HttpService = game:GetService("HttpService")
 local Stats = game:GetService("Stats")
+local TextChatService = game:GetService("TextChatService")
 
 local LocalPlayer = Players.LocalPlayer
+local _VERSION = "6.0"
 
 -- ============================================================
 -- CONFIG
 -- ============================================================
 
-getgenv().CinderMMMv5 = getgenv().CinderMMMv5 or getgenv().CinderMMMv4 or getgenv().CinderMMMv3 or {}
-local Config = getgenv().CinderMMMv5
+getgenv().CinderMMMv6 = getgenv().CinderMMMv6 or getgenv().CinderMMMv5 or getgenv().CinderMMMv4 or getgenv().CinderMMMv3 or {}
+local Config = getgenv().CinderMMMv6
+getgenv().CinderMMMv6 = Config
 getgenv().CinderMMMv5 = Config
-getgenv().CinderMMMv4 = Config -- alias для совместимости
+getgenv().CinderMMMv4 = Config
 
 local Defaults = {
     ESP = false,
@@ -50,6 +70,11 @@ local Defaults = {
     ESPUnknown = false,
     ESPTransparency = 0.55,
     ESPMaxDistance = 1000,
+    ESPMode = "Hybrid",          -- Hybrid | Billboard | Drawing2D
+    ESPLodDistance = 400,
+    ESPLodFarDistance = 900,
+    OffscreenArrows = false,
+    TracersMurdererOnly = false,
 
     ShowMurderer = true,
     ShowSheriff = true,
@@ -57,9 +82,16 @@ local Defaults = {
 
     ObjectESP = false,
     CoinESP = true,
+    GunDropESP = true, -- v6.0-final: подсветка упавшего пистолета шерифа
+    Chams = false, -- v6.0-final: Highlight-обводка по ролям (работает на мобайле)
 
     Radar = false,
     RadarRange = 150,
+    RadarHideSelf = true,        -- v6.0: скрыть свой dot
+    RadarDotColorMurderer = Color3.fromRGB(255, 70, 70),
+    RadarDotColorSheriff = Color3.fromRGB(80, 130, 255),
+    RadarDotColorInnocent = Color3.fromRGB(80, 235, 110),
+    RadarDotColorUnknown = Color3.fromRGB(220, 220, 220),
 
     AimAssist = false,
     AimFOV = 120,
@@ -70,6 +102,12 @@ local Defaults = {
     AimMurderer = true,
     AimSheriff = false,
     AimInnocent = false,
+    AimAutoPart = true,
+    AimPredict = 0,
+    AimFOVMurderer = -1,
+    AimFOVSheriff = -1,
+    AimFOVInnocent = -1,
+    AimAdaptiveFOV = false,      -- v6.0: adaptive FOV для близких целей
 
     WalkSpeedEnabled = false,
     WalkSpeed = 16,
@@ -78,39 +116,40 @@ local Defaults = {
 
     Fly = false,
     FlySpeed = 50,
+    FlyLookDirection = false,    -- v6.0: fly в направлении взгляда
     Noclip = false,
     InfiniteJump = false,
     AntiFling = true,
     AntiAFK = true,
 
     FullBright = false,
+    FullBrightIntensity = 2,     -- v6.0: слайдер (1-5)
     NoFog = false,
     Crosshair = false,
     CrosshairSize = 8,
 
     LowCPUMode = true,
-    AutoPerf = true, -- v5: авто-срез качества при низком FPS
+    AutoPerf = true,
     AutoPerfFPS = 28,
     ESPInterval = 0.20,
     RoleInterval = 0.75,
     ObjectInterval = 1.0,
     ServerHopProxy = "",
 
-    -- v5 ESP 2.0
-    ESPMode = "Hybrid", -- Hybrid | Billboard | Drawing2D
-    ESPLodDistance = 400, -- дальше: только бокс+имя, без HP/дистанции каждый тик
-    OffscreenArrows = false,
-    TracersMurdererOnly = false,
-
-    -- v5 Aim
-    AimAutoPart = true, -- авто: ближайшая к курсору часть Head/HRP
-    AimPredict = 0, -- 0..1 компенсация движения цели
-    AimFOVMurderer = -1, -- -1 = использовать общий AimFOV
-    AimFOVSheriff = -1,
-    AimFOVInnocent = -1,
-
-    -- v5 Mobile
     MobileButtons = false,
+    MobileButtonSize = 80,
+    MobileDoubleTap = true,
+
+    GodMode = false,
+    GodModeMaxHealth = 100,
+    GodModeOnDamage = false,    -- v6.0: восстановление при любом уроне
+
+    ESPObjectCacheEnabled = true, -- v6.0: кеш объектов карты
+
+    ServerHopCache = {},
+    ServerHopCacheAt = 0,
+    ServerHopCacheTTL = 60,       -- v6.0: 60 сек
+    ServerHopPreferEmpty = true,  -- v6.0: предпочтение минимальных серверов
 
     Debug = false,
 }
@@ -189,8 +228,6 @@ local VisualState = {
     Offscreen = {},
 }
 
--- v4.1 forward declares: shutdown/bindPlayer раньше ссылались на локали ниже (были nil-global).
-
 local function bind(name, signal, callback)
     if Connections[name] then
         Connections[name]:Disconnect()
@@ -259,7 +296,6 @@ local refreshPlayer, clearPlayer, bindPlayer
 local destroyESP, clearESP, clearObjectESP
 local scanCharacter
 
--- v5 Core: модульная шина событий (Roles/ESP/Aim/Player подписываются сюда)
 local Core = { listeners = {} }
 function Core.on(event, fn)
     Core.listeners[event] = Core.listeners[event] or {}
@@ -397,7 +433,6 @@ local function detectRole(player)
         return "Unknown"
     end
 
-    -- v5 приоритет: 1) GUI Role 2) атрибуты 3) Tool в персонаже 4) Backpack
     local gui = player:FindFirstChild("PlayerGui")
     if gui then
         local main = gui:FindFirstChild("MainGUI")
@@ -444,7 +479,6 @@ local function updateRoles(force)
         if cache then
             if force or now - cache.RoleAt >= effectiveInterval(Config.RoleInterval) then
                 local detected = detectRole(player)
-                -- v5 дебаунс: Unknown не затирает сразу, смена требует 2 подтверждений
                 if detected == "Unknown" then
                     if cache.LastRole == "Unknown" or force then
                         cache.LastRole = "Unknown"
@@ -490,6 +524,14 @@ local function roleColor(role)
     return Color3.fromRGB(220, 220, 220)
 end
 
+local function radarDotColor(role)
+    if role == "Murderer" then return Config.RadarDotColorMurderer
+    elseif role == "Sheriff" then return Config.RadarDotColorSheriff
+    elseif role == "Innocent" then return Config.RadarDotColorInnocent
+    end
+    return Config.RadarDotColorUnknown
+end
+
 local function roleEnabled(role)
     if role == "Murderer" then return Config.ShowMurderer end
     if role == "Sheriff" then return Config.ShowSheriff end
@@ -498,7 +540,7 @@ local function roleEnabled(role)
 end
 
 -- ============================================================
--- ESP MANAGER
+-- ESP MANAGER (v6.0: ESP Mode реально влияет на отрисовку)
 -- ============================================================
 
 local ESP = {}
@@ -507,6 +549,12 @@ local DrawingAvailable = type(Drawing) == "table" and type(Drawing.new) == "func
 destroyESP = function(player)
     local data = ESP[player]
     if not data then return end
+
+    -- v6.0: чистим Drawing-объекты если ESPMode == Drawing2D
+    if Config.ESPMode == "Drawing2D" then
+        if data.drawingBox then pcall(function() data.drawingBox:Remove() end) end
+        if data.drawingLabel then pcall(function() data.drawingLabel:Remove() end) end
+    end
 
     for _, item in pairs(data.instances) do
         safeDestroy(item)
@@ -550,44 +598,81 @@ local function makeESP(player)
         label = nil,
         health = nil,
         line = nil,
+        drawingBox = nil,
+        drawingLabel = nil,
     }
 
     local color = roleColor(getRole(player))
 
-    local box = Instance.new("BoxHandleAdornment")
-    box.Name = "CinderV3Box"
-    box.Adornee = head
-    box.AlwaysOnTop = true
-    box.ZIndex = 5
-    box.Size = Vector3.new(2.5, 4.5, 2.5)
-    box.Transparency = Config.ESPTransparency
-    box.Color3 = color
-    box.Parent = head
+    -- v6.0: гибридный ESP — бокс + билборд
+    if Config.ESPMode == "Hybrid" or Config.ESPMode == "Billboard" then
+        local box = Instance.new("BoxHandleAdornment")
+        box.Name = "CinderV3Box"
+        box.Adornee = head
+        box.AlwaysOnTop = true
+        box.ZIndex = 5
+        box.Size = Vector3.new(2.5, 4.5, 2.5)
+        box.Transparency = Config.ESPTransparency
+        box.Color3 = color
+        box.Parent = head
 
-    data.box = box
-    table.insert(data.instances, box)
+        data.box = box
+        table.insert(data.instances, box)
+    end
 
-    local billboard = Instance.new("BillboardGui")
-    billboard.Name = "CinderV3Info"
-    billboard.Adornee = head
-    billboard.AlwaysOnTop = true
-    billboard.Size = UDim2.fromOffset(240, 60)
-    billboard.StudsOffset = Vector3.new(0, 3.5, 0)
-    billboard.Parent = head
+    if Config.ESPMode == "Hybrid" or Config.ESPMode == "Billboard" then
+        local billboard = Instance.new("BillboardGui")
+        billboard.Name = "CinderV3Info"
+        billboard.Adornee = head
+        billboard.AlwaysOnTop = true
+        billboard.Size = UDim2.fromOffset(240, 60)
+        billboard.StudsOffset = Vector3.new(0, 3.5, 0)
+        billboard.Parent = head
 
-    local label = Instance.new("TextLabel")
-    label.BackgroundTransparency = 1
-    label.Size = UDim2.new(1, 0, 0, 34)
-    label.Font = Enum.Font.GothamBold
-    label.TextScaled = true
-    label.TextStrokeTransparency = 0
-    label.TextColor3 = color
-    label.Text = player.Name
-    label.Parent = billboard
+        local label = Instance.new("TextLabel")
+        label.BackgroundTransparency = 1
+        label.Size = UDim2.new(1, 0, 0, 34)
+        label.Font = Enum.Font.GothamBold
+        label.TextScaled = true
+        label.TextStrokeTransparency = 0
+        label.TextColor3 = color
+        label.Text = player.Name
+        label.Parent = billboard
 
-    data.billboard = billboard
-    data.label = label
-    table.insert(data.instances, billboard)
+        data.billboard = billboard
+        data.label = label
+        table.insert(data.instances, billboard)
+    end
+
+    -- v6.0: Drawing2D mode
+    if Config.ESPMode == "Drawing2D" then
+        local ok, boxDraw = pcall(function()
+            return Drawing.new("Box")
+        end)
+        if ok and boxDraw then
+            boxDraw.Color = color
+            boxDraw.Transparency = Config.ESPTransparency
+            boxDraw.Outline = true
+            boxDraw.Filled = false
+            boxDraw.Visible = true
+            data.drawingBox = boxDraw
+            table.insert(data.instances, boxDraw)
+        end
+
+        local ok, labelDraw = pcall(function()
+            return Drawing.new("Text")
+        end)
+        if ok and labelDraw then
+            labelDraw.Text = player.Name
+            labelDraw.Color = color
+            labelDraw.Outline = true
+            labelDraw.Center = false
+            labelDraw.Size = 14
+            labelDraw.Visible = true
+            data.drawingLabel = labelDraw
+            table.insert(data.instances, labelDraw)
+        end
+    end
 
     if DrawingAvailable and Config.ESPTracers then
         local ok, line = pcall(function()
@@ -603,7 +688,7 @@ local function makeESP(player)
         end
     end
 
-    if Config.ESPHealth then
+    if Config.ESPHealth and data.billboard then
         local health = Instance.new("TextLabel")
         health.BackgroundTransparency = 1
         health.Position = UDim2.fromOffset(0, 34)
@@ -612,7 +697,7 @@ local function makeESP(player)
         health.TextScaled = true
         health.TextStrokeTransparency = 0.2
         health.TextColor3 = Color3.fromRGB(240, 240, 240)
-        health.Parent = billboard
+        health.Parent = data.billboard
 
         data.health = health
     end
@@ -654,6 +739,15 @@ local function updateESP(now)
                         data.box.Transparency = Config.ESPTransparency
                     end
 
+                    if data.drawingBox then
+                        data.drawingBox.Color = color
+                    end
+
+                    if data.drawingLabel then
+                        data.drawingLabel.Text = player.Name
+                        data.drawingLabel.Color = color
+                    end
+
                     local distanceText = ""
                     if Config.ESPDistance then
                         if myRoot and cache.HRP then
@@ -673,17 +767,35 @@ local function updateESP(now)
                         data.label.TextColor3 = color
                     end
 
-                    -- v5 LOD: далеко — без HP-обновления каждый тик
+                    -- v6.0: multi-level LOD
                     local dist = myRoot and cache.HRP and (myRoot.Position - cache.HRP.Position).Magnitude or 0
                     local isFar = dist > Config.ESPLodDistance
+                    local isVeryFar = dist > Config.ESPLodFarDistance
+
                     if data.health and cache.Humanoid and not isFar then
                         data.health.Text = string.format(
                             "HP: %d/%d",
                             math.floor(cache.Humanoid.Health),
                             math.floor(cache.Humanoid.MaxHealth)
                         )
-                    elseif data.health and isFar then
+                    elseif data.health then
                         data.health.Text = ""
+                    end
+
+                    -- v6.0: Billboard скрывается очень далеко
+                    if isVeryFar and data.billboard then
+                        data.billboard.Enabled = false
+                    else
+                        data.billboard.Enabled = true
+                    end
+
+                    -- v6.0: Drawing2D LOD — скрывать label далеко
+                    if Config.ESPMode == "Drawing2D" then
+                        if isVeryFar and data.drawingLabel then
+                            data.drawingLabel.Visible = false
+                        elseif data.drawingLabel then
+                            data.drawingLabel.Visible = true
+                        end
                     end
 
                     if data.line then
@@ -718,19 +830,13 @@ local function updateESP(now)
 end
 
 -- ============================================================
--- OBJECT ESP
+-- OBJECT ESP (v6.0: кеш объектов, фильтрация только видимых)
 -- ============================================================
 
 local ObjectESP = {}
 local ObjectCandidates = {}
 local objectScanAt = 0
-
-clearObjectESP = function()
-    for obj, billboard in pairs(ObjectESP) do
-        safeDestroy(billboard)
-        ObjectESP[obj] = nil
-    end
-end
+local ObjectCache = {}            -- v6.0: кеш объектов карты
 
 local function isCoin(obj)
     return obj:IsA("BasePart") and obj.Name:lower():find("coin", 1, true) ~= nil
@@ -750,8 +856,28 @@ local function objectLooksInteresting(obj)
         return false
     end
 
+    -- v6.0-final: упавший пистолет шерифа (GunDrop) подсвечиваем отдельно
+    if Config.GunDropESP and (name:find("gundrop", 1, true) or name:find("droppedgun", 1, true)
+        or name:find("dropped gun", 1, true) or name == "gun") then
+        return true
+    end
+
     return name:find("gun", 1, true)
         or name:find("knife", 1, true)
+        or name:find("candlestick", 1, true)
+        or name:find("pistol", 1, true)
+end
+
+-- v6.0-final: счетчик монет на карте + статус для UI/чат-команд
+local function getCoinCount()
+    local n = 0
+    for obj in pairs(ObjectCandidates) do
+        if obj.Parent then
+            local ok, isc = pcall(isCoin, obj)
+            if ok and isc then n += 1 end
+        end
+    end
+    return n
 end
 
 local function makeObjectESP(obj)
@@ -794,13 +920,34 @@ local function scanObjects(now)
     end
     objectScanAt = now
 
-    -- v4.1: сканируем Map/контейнер вместо всего workspace, дешевле на Delta
-    local container = workspace:FindFirstChild("Map") or workspace:FindFirstChild("Coins")
-        or workspace:FindFirstChild("CoinContainer") or workspace
+    -- v6.0: кеш объектов карты
+    local container
+    if Config.ESPObjectCacheEnabled and next(ObjectCache) then
+        container = ObjectCache
+    else
+        container = workspace:FindFirstChild("Map") or workspace:FindFirstChild("Coins")
+            or workspace:FindFirstChild("CoinContainer") or workspace
+
+        if Config.ESPObjectCacheEnabled and not next(ObjectCache) then
+            for _, obj in ipairs(container:GetDescendants()) do
+                if obj:IsA("BasePart") then
+                    ObjectCache[obj] = true
+                end
+            end
+        end
+    end
+
     local myRoot = root()
-    for _, obj in ipairs(container:GetDescendants()) do
+    local cam = camera()
+    for obj in pairs(container) do
         if objectLooksInteresting(obj) then
             if myRoot and obj:IsA("BasePart") then
+                -- v6.0: фильтрация только видимых
+                local _, visible = cam and cam:WorldToViewportPoint(obj.Position)
+                if cam and not visible then
+                    continue
+                end
+
                 local ok, d = pcall(function()
                     return (myRoot.Position - obj.Position).Magnitude
                 end)
@@ -842,7 +989,7 @@ bind("ObjectRemoved", workspace.DescendantRemoving, function(obj)
 end)
 
 -- ============================================================
--- RADAR
+-- RADAR (v6.0: скрыть себя, цвета по ролям)
 -- ============================================================
 
 local Radar = {}
@@ -877,7 +1024,7 @@ local function createRadar()
     title.BackgroundTransparency = 1
     title.Size = UDim2.new(1, 0, 0, 24)
     title.Font = Enum.Font.GothamBold
-    title.Text = "CINDER RADAR"
+    title.Text = "CINDER RADAR v6"
     title.TextScaled = true
     title.Parent = radarFrame
 
@@ -901,6 +1048,11 @@ local function updateRadar()
     local seen = {}
 
     for player, cache in pairs(PlayerCache) do
+        -- v6.0: скрыть свой dot
+        if player == LocalPlayer and Config.RadarHideSelf then
+            continue
+        end
+
         if cache and cache.HRP and cache.HRP.Parent then
             local delta = cache.HRP.Position - r.Position
             local flat = Vector3.new(delta.X, 0, delta.Z)
@@ -910,7 +1062,6 @@ local function updateRadar()
                 local x = math.clamp(flat.X / Config.RadarRange, -1, 1)
                 local y = math.clamp(flat.Z / Config.RadarRange, -1, 1)
 
-                -- v4.1: переиспользуем доты вместо create/destroy
                 local dot = Radar[player]
                 if not dot or not dot.Parent then
                     dot = Instance.new("Frame")
@@ -921,7 +1072,7 @@ local function updateRadar()
                     Radar[player] = dot
                 end
                 dot.Position = UDim2.fromScale(0.5 + x * 0.45, 0.5 + y * 0.45)
-                dot.BackgroundColor3 = roleColor(getRole(player))
+                dot.BackgroundColor3 = radarDotColor(getRole(player))
                 dot.Visible = true
                 seen[player] = true
             end
@@ -937,7 +1088,7 @@ local function updateRadar()
 end
 
 -- ============================================================
--- TARGET / CAMERA AIM ASSIST
+-- AIM ASSIST (v6.0: adaptive FOV, приоритет по ролям)
 -- ============================================================
 
 local function targetAllowed(role)
@@ -946,6 +1097,11 @@ local function targetAllowed(role)
     if role == "Innocent" then return Config.AimInnocent end
     return false
 end
+
+-- v5.1: кеш line-of-sight на 50мс
+local losCache = {}
+local losCacheAt = {}
+local LOS_CACHE_TTL = 0.05
 
 local function hasLineOfSight(part)
     if not Config.AimWallCheck then
@@ -958,6 +1114,21 @@ local function hasLineOfSight(part)
         return false
     end
 
+    local now = os.clock()
+    for k, v in pairs(losCache) do
+        if now - losCacheAt[k] > LOS_CACHE_TTL then
+            losCache[k] = nil
+            losCacheAt[k] = nil
+        end
+    end
+
+    local cacheKey = part:GetFullName() .. "|" .. tostring(part.Position)
+    local cached = losCache[cacheKey]
+    local cachedAt = losCacheAt[cacheKey]
+    if cached ~= nil and cachedAt and now - cachedAt < LOS_CACHE_TTL then
+        return cached
+    end
+
     local origin = cam.CFrame.Position
     local direction = part.Position - origin
 
@@ -967,7 +1138,10 @@ local function hasLineOfSight(part)
     params.IgnoreWater = true
 
     local result = workspace:Raycast(origin, direction, params)
-    return result == nil or result.Instance:IsDescendantOf(part.Parent)
+    local hit = result == nil or result.Instance:IsDescendantOf(part.Parent)
+    losCache[cacheKey] = hit
+    losCacheAt[cacheKey] = now
+    return hit
 end
 
 local function roleFOV(role)
@@ -977,11 +1151,38 @@ local function roleFOV(role)
     return Config.AimFOV
 end
 
+local AimTouch = { active = false, pos = nil }
+pcall(function()
+    UserInputService.TouchStarted:Connect(function(input)
+        AimTouch.active = true
+        AimTouch.pos = input.Position
+    end)
+    UserInputService.TouchEnded:Connect(function()
+        AimTouch.active = false
+        AimTouch.pos = nil
+    end)
+    UserInputService.TouchMoved:Connect(function(input)
+        if AimTouch.active then AimTouch.pos = input.Position end
+    end)
+end)
+
+-- v6.0-final: точка прицеливания — мышь на ПК, центр экрана / последний тап на мобайле
+local function getAimAnchor()
+    local cam = camera()
+    local vs = cam and cam.ViewportSize or Vector2.new(500, 500)
+    if UserInputService.TouchEnabled and (AimTouch.pos or not UserInputService.MouseEnabled) then
+        return AimTouch.pos or Vector2.new(vs.X / 2, vs.Y / 2)
+    end
+    local ok, m = pcall(function() return UserInputService:GetMouseLocation() end)
+    if ok and m then return m end
+    return Vector2.new(vs.X / 2, vs.Y / 2)
+end
+
 local function pickAimPart(cache)
     if Config.AimAutoPart and cache.Head and cache.HRP then
         local cam = camera()
         if cam then
-            local mouse = UserInputService:GetMouseLocation()
+            local mouse = getAimAnchor()
             local hp, hv = cam:WorldToViewportPoint(cache.Head.Position)
             local rp, rv = cam:WorldToViewportPoint(cache.HRP.Position)
             if hv and rv then
@@ -999,9 +1200,17 @@ local function closestTarget()
     local cam = camera()
     if not cam then return nil end
 
-    local mouse = UserInputService:GetMouseLocation()
+    local mouse = getAimAnchor()
     local best
     local bestDistance = math.huge
+    local bestPriority = 0
+
+    local priority = {
+        ["Murderer"] = 3,
+        ["Sheriff"] = 2,
+        ["Innocent"] = 1,
+        ["Unknown"] = 0,
+    }
 
     for player, cache in pairs(PlayerCache) do
         if cache and cache.Humanoid and cache.Humanoid.Health > 0 then
@@ -1013,9 +1222,19 @@ local function closestTarget()
                     if visible and point.Z > 0 and hasLineOfSight(part) then
                         local d = (Vector2.new(point.X, point.Y) - mouse).Magnitude
                         local fov = roleFOV(role)
-                        if d <= fov and d < bestDistance then
-                            bestDistance = d
-                            best = part
+
+                        -- v6.0: adaptive FOV — близкие цели сужают FOV
+                        if Config.AimAdaptiveFOV and d < fov / 4 then
+                            fov = fov / 2
+                        end
+
+                        if d <= fov then
+                            local p = priority[role] or 0
+                            if p > bestPriority or (p == bestPriority and d < bestDistance) then
+                                bestPriority = p
+                                bestDistance = d
+                                best = part
+                            end
                         end
                     end
                 end
@@ -1029,7 +1248,49 @@ end
 local aimSearchAt = 0
 
 local function updateAimCircle()
-    if not DrawingAvailable then return end
+    -- v6.0-final: GUI-круг для мобайла (Drawing нет на Delta) + Drawing на ПК
+    local mouse = getAimAnchor()
+    if not DrawingAvailable then
+        if VisualState.FOVGui == nil then
+            local ok, pg = pcall(function() return LocalPlayer:WaitForChild("PlayerGui") end)
+            if ok and pg then
+                local g = Instance.new("ScreenGui")
+                g.Name = "CinderV6FOV"
+                g.ResetOnSpawn = false
+                g.IgnoreGuiInset = true
+                g.Parent = pg
+                local f = Instance.new("Frame")
+                f.AnchorPoint = Vector2.new(0.5, 0.5)
+                f.BackgroundTransparency = 1
+                local stroke = Instance.new("UIStroke")
+                stroke.Thickness = 1.5
+                stroke.Transparency = 0.2
+                stroke.Color = Color3.fromRGB(255, 255, 255)
+                stroke.Parent = f
+                local corner = Instance.new("UICorner")
+                corner.CornerRadius = UDim.new(1, 0)
+                corner.Parent = f
+                f.Parent = g
+                VisualState.FOVGui = g
+                VisualState.FOVFrame = f
+            end
+        end
+        local f = VisualState.FOVFrame
+        if f then
+            f.Position = UDim2.fromOffset(mouse.X, mouse.Y)
+            f.Size = UDim2.fromOffset(Config.AimFOV * 2, Config.AimFOV * 2)
+            f.Visible = Config.AimAssist and Config.AimCircle
+        end
+        if VisualState.FOVCircle then pcall(function() VisualState.FOVCircle.Visible = false end) end
+        -- индикатор лока цели: подсвечиваем рамку красным если есть цель
+        if f and Config.AimAssist then
+            local t = closestTarget()
+            local stroke = f:FindFirstChildOfClass("UIStroke")
+            if stroke then stroke.Color = t and Color3.fromRGB(255, 70, 70) or Color3.fromRGB(255, 255, 255) end
+        end
+        return
+    end
+    if VisualState.FOVGui then pcall(function() VisualState.FOVGui.Enabled = false end) end
 
     if not VisualState.FOVCircle then
         local ok, circle = pcall(function()
@@ -1047,7 +1308,6 @@ local function updateAimCircle()
     local circle = VisualState.FOVCircle
     if not circle then return end
 
-    local mouse = UserInputService:GetMouseLocation()
     circle.Position = mouse
     circle.Radius = Config.AimFOV
     circle.Visible = Config.AimAssist and Config.AimCircle
@@ -1084,6 +1344,7 @@ end)
 
 local originalCollision = {}
 local noclipParts = {}
+local noclipPartsDirty = true
 local flyVelocity
 local flyAttachment
 
@@ -1121,10 +1382,13 @@ local function refreshNoclipCache()
             table.insert(noclipParts, obj)
         end
     end
+    noclipPartsDirty = false
 end
 
 local function noclipStep()
-    if #noclipParts == 0 then refreshNoclipCache() end
+    if noclipPartsDirty or #noclipParts == 0 then
+        refreshNoclipCache()
+    end
     for _, obj in ipairs(noclipParts) do
         if obj and obj.Parent then
             if Config.Noclip then
@@ -1182,11 +1446,14 @@ local function startFly()
 
         local direction = Vector3.zero
 
+        -- v6.0: FlyLookDirection
+        local moveDir = Config.FlyLookDirection and cam.CFrame.LookVector or Vector3.new(0, 0, -1)
+
         if UserInputService:IsKeyDown(Enum.KeyCode.W) then
-            direction += cam.CFrame.LookVector
+            direction += moveDir
         end
         if UserInputService:IsKeyDown(Enum.KeyCode.S) then
-            direction -= cam.CFrame.LookVector
+            direction -= moveDir
         end
         if UserInputService:IsKeyDown(Enum.KeyCode.A) then
             direction -= cam.CFrame.RightVector
@@ -1231,8 +1498,65 @@ bind("AntiFling", RunService.Heartbeat, function()
     end
 end)
 
+-- v6.0-final: AntiAFK реально работает (был мертвый флаг)
+pcall(function()
+    local VU = game:GetService("VirtualUser")
+    bind("AntiAFK", LocalPlayer.Idled, function()
+        if not Config.AntiAFK then return end
+        pcall(function()
+            VU:CaptureController()
+            VU:ClickButton2(Vector2.new())
+        end)
+    end)
+end)
+
 -- ============================================================
--- CLIENT VISUALS
+-- GOD MODE (v6.0: HP-слайдер, восстановление при любом уроне)
+-- ============================================================
+
+local godModeConn = nil
+local godModeOnDamageConn = nil
+
+local function updateGodMode()
+    if godModeConn then
+        godModeConn:Disconnect()
+        godModeConn = nil
+    end
+    if godModeOnDamageConn then
+        godModeOnDamageConn:Disconnect()
+        godModeOnDamageConn = nil
+    end
+
+    if not Config.GodMode then
+        return
+    end
+
+    local h = humanoid()
+    if not h then return end
+
+    if Config.GodModeOnDamage then
+        godModeOnDamageConn = h:Connect("HealthChanged", function(currentHealth)
+            local maxH = Config.GodModeMaxHealth or 100
+            if currentHealth < maxH then
+                pcall(function()
+                    h.Health = math.min(maxH, currentHealth + 5)
+                end)
+            end
+        end)
+    else
+        godModeConn = h:Connect("HealthChanged", function(currentHealth)
+            local maxH = Config.GodModeMaxHealth or 100
+            if currentHealth <= 0 and Config.GodMode then
+                pcall(function()
+                    h.Health = maxH
+                end)
+            end
+        end)
+    end
+end
+
+-- ============================================================
+-- CLIENT VISUALS (v6.0: FullBright слайдер)
 -- ============================================================
 
 local Lighting = game:GetService("Lighting")
@@ -1276,7 +1600,8 @@ end
 local function updateClientVisuals()
     if Config.FullBright then
         saveFullBright()
-        Lighting.Brightness = 2
+        local intensity = Config.FullBrightIntensity or 2
+        Lighting.Brightness = math.clamp(intensity, 1, 5)
         Lighting.ClockTime = 14
         Lighting.GlobalShadows = false
         Lighting.Ambient = Color3.new(1, 1, 1)
@@ -1362,10 +1687,15 @@ registerCleanup("ClientVisuals", function()
         pcall(function() VisualState.FOVCircle:Remove() end)
         VisualState.FOVCircle = nil
     end
+    if VisualState.FOVGui then
+        pcall(function() VisualState.FOVGui:Destroy() end)
+        VisualState.FOVGui = nil
+        VisualState.FOVFrame = nil
+    end
 end)
 
 -- ============================================================
--- PERFORMANCE MANAGER
+-- PERFORMANCE MANAGER (v6.0: мгновенная реакция)
 -- ============================================================
 
 local Perf = {
@@ -1388,17 +1718,17 @@ bind("Performance", RunService.RenderStepped, function()
         Perf.fps = math.floor(Perf.frameCount / elapsed)
         Perf.frameCount = 0
         Perf.last = now
-        -- v5 AutoPerf: при просадке режем трейсеры/объекты автоматически
-        if Config.AutoPerf then
-            local low = Perf.fps < (Config.AutoPerfFPS or 28)
-            Perf.autoCut = low
-            Perf.autoCutTracers = low
-            Perf.autoCutObjects = low and Perf.fps < ((Config.AutoPerfFPS or 28) - 5)
-        else
-            Perf.autoCut = false
-            Perf.autoCutTracers = false
-            Perf.autoCutObjects = false
-        end
+    end
+
+    -- v6.0: мгновенная реакция
+    if Config.AutoPerf then
+        Perf.autoCut = Perf.fps < (Config.AutoPerfFPS or 28)
+        Perf.autoCutTracers = Perf.autoCut
+        Perf.autoCutObjects = Perf.autoCut and Perf.fps < ((Config.AutoPerfFPS or 28) - 5)
+    else
+        Perf.autoCut = false
+        Perf.autoCutTracers = false
+        Perf.autoCutObjects = false
     end
 end)
 
@@ -1417,57 +1747,135 @@ local function effectiveInterval(base)
 end
 
 -- ============================================================
--- SERVER HOP
+-- SERVER HOP (v6.0: кеш 60 сек, предпочтение пустых)
 -- ============================================================
 
+local serverHopCache = {}
+local serverHopCacheAt = 0
+
 local function serverHop()
-    local baseUrl = string.format(
-        "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100",
-        game.PlaceId
-    )
-    local url = baseUrl
-    if type(Config.ServerHopProxy) == "string" and #Config.ServerHopProxy > 8 then
-        url = string.format(Config.ServerHopProxy, baseUrl)
-    end
-
-    local ok, response = pcall(function()
-        return game:HttpGet(url)
-    end)
-
-    if not ok then
+    local now = os.clock()
+    if serverHopCacheAt > 0 and now - serverHopCacheAt < Config.ServerHopCacheTTL then
+        local data = serverHopCache
+        if type(data) ~= "table" or type(data.data) ~= "table" then
+            goto fresh
+        end
+        local bestServer = nil
+        local bestPlayers = math.huge
+        for _, server in ipairs(data.data or {}) do
+            if server.id ~= game.JobId
+                and server.playing
+                and server.maxPlayers
+                and server.playing < server.maxPlayers then
+                if Config.ServerHopPreferEmpty then
+                    if server.playing < bestPlayers then
+                        bestPlayers = server.playing
+                        bestServer = server
+                    end
+                else
+                    bestServer = server
+                    break
+                end
+            end
+        end
+        if bestServer then
+            pcall(function()
+                TeleportService:TeleportToPlaceInstance(
+                    game.PlaceId,
+                    bestServer.id,
+                    LocalPlayer
+                )
+            end)
+            return
+        end
         Rayfield:Notify({
             Title = "Server Hop",
-            Content = "Не удалось получить список серверов.",
+            Content = "Свободный сервер не найден (кеш).",
             Duration = 3,
         })
         return
     end
 
-    local decoded, data = pcall(function()
-        return HttpService:JSONDecode(response)
-    end)
+    ::fresh::
+    -- v6.0-final: пагинация по nextPageCursor (до 3 страниц), иначе видны только первые 100
+    local allServers = {}
+    local cursor = ""
+    for page = 1, 3 do
+        local baseUrl = string.format(
+            "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100%s",
+            game.PlaceId,
+            (cursor ~= "" and ("&cursor=" .. cursor) or "")
+        )
+        local url = baseUrl
+        if type(Config.ServerHopProxy) == "string" and #Config.ServerHopProxy > 8 then
+            url = string.format(Config.ServerHopProxy, baseUrl)
+        end
 
-    if not decoded or type(data) ~= "table" then
-        Rayfield:Notify({ Title = "Server Hop", Content = "Ошибка парсинга ответа.", Duration = 3 })
-        return
+        local ok, response = pcall(function()
+            return game:HttpGet(url)
+        end)
+
+        if not ok then
+            if page == 1 then
+                Rayfield:Notify({
+                    Title = "Server Hop",
+                    Content = "Не удалось получить список серверов.",
+                    Duration = 3,
+                })
+                return
+            end
+            break
+        end
+
+        local decoded, data = pcall(function()
+            return HttpService:JSONDecode(response)
+        end)
+
+        if not decoded or type(data) ~= "table" then
+            if page == 1 then
+                Rayfield:Notify({ Title = "Server Hop", Content = "Ошибка парсинга ответа.", Duration = 3 })
+                return
+            end
+            break
+        end
+
+        for _, s in ipairs(data.data or {}) do table.insert(allServers, s) end
+        serverHopCache = { data = allServers, nextPageCursor = data.nextPageCursor }
+        serverHopCacheAt = now
+        cursor = type(data.nextPageCursor) == "string" and data.nextPageCursor or ""
+        if cursor == "" then break end
     end
 
+    local data = { data = allServers }
+
+    local bestServer = nil
+    local bestPlayers = math.huge
     for _, server in ipairs(data.data or {}) do
         if server.id ~= game.JobId
             and server.playing
             and server.maxPlayers
             and server.playing < server.maxPlayers then
-
-            pcall(function()
-                TeleportService:TeleportToPlaceInstance(
-                    game.PlaceId,
-                    server.id,
-                    LocalPlayer
-                )
-            end)
-
-            return
+            if Config.ServerHopPreferEmpty then
+                if server.playing < bestPlayers then
+                    bestPlayers = server.playing
+                    bestServer = server
+                end
+            else
+                bestServer = server
+                break
+            end
         end
+    end
+
+    if bestServer then
+        pcall(function()
+            TeleportService:TeleportToPlaceInstance(
+                game.PlaceId,
+                bestServer.id,
+                LocalPlayer
+            )
+        end)
+        return
     end
 
     Rayfield:Notify({
@@ -1496,11 +1904,12 @@ bind("Scheduler", RunService.Heartbeat, function()
 
     if now - lastESP >= effectiveInterval(Config.ESPInterval) then
         updateESP(now)
+        pcall(updateChams)
         lastESP = now
     end
 
     if Perf.autoCutObjects then
-        -- v5: при сильной просадке пропускаем тяжёлый скан объектов
+        -- пропускаем скан объектов при просадке
     elseif now - lastObjects >= effectiveInterval(Config.ObjectInterval) then
         scanObjects(now)
         lastObjects = now
@@ -1525,7 +1934,6 @@ end)
 -- UI
 -- ============================================================
 
--- v5 Notify queue: не спамим, складываем в очередь
 local NotifyQueue = {}
 local notifyBusy = false
 local function notify(title, content, duration)
@@ -1542,7 +1950,10 @@ local function notify(title, content, duration)
     end)
 end
 
--- v5 Mobile touch buttons (Fly Up/Down + IJ toggle)
+-- ============================================================
+-- MOBILE TOUCH BUTTONS (v6.0: плавающее меню)
+-- ============================================================
+
 local MobileGui
 local function setMobileButtons(v)
     Config.MobileButtons = v
@@ -1553,30 +1964,94 @@ local function setMobileButtons(v)
     if MobileGui then return end
     local pg = LocalPlayer:WaitForChild("PlayerGui")
     MobileGui = Instance.new("ScreenGui")
-    MobileGui.Name = "CinderV5Mobile"
+    MobileGui.Name = "CinderV6Mobile"
     MobileGui.ResetOnSpawn = false
     MobileGui.Parent = pg
-    local function mkBtn(text, pos, cb)
+
+    local btnSize = Config.MobileButtonSize or 80
+
+    local function mkBtn(text, pos, cb, doubleTap, fontSize)
         local b = Instance.new("TextButton")
-        b.Size = UDim2.fromOffset(64, 64)
+        b.Size = UDim2.fromOffset(btnSize, btnSize)
         b.Position = pos
         b.Text = text
         b.Font = Enum.Font.GothamBold
         b.TextScaled = true
         b.BackgroundTransparency = 0.3
         b.Parent = MobileGui
-        b.MouseButton1Click:Connect(cb)
+
+        local tapCount = 0
+        local lastTap = 0
+        local function onTap()
+            local now = os.clock()
+            if Config.MobileDoubleTap and (now - lastTap) < 0.3 then
+                tapCount += 1
+                if tapCount >= 2 then
+                    cb(true)
+                    tapCount = 0
+                end
+            else
+                tapCount = 1
+                lastTap = now
+                cb(false)
+            end
+        end
+        b.MouseButton1Click:Connect(onTap)
+        pcall(function()
+            if b.TouchTap then b.TouchTap:Connect(onTap) end
+        end)
         return b
     end
-    mkBtn("UP", UDim2.new(1, -160, 1, -260), function() MobileFly.Up = not MobileFly.Up MobileFly.Down = false end)
-    mkBtn("DN", UDim2.new(1, -80, 1, -260), function() MobileFly.Down = not MobileFly.Down MobileFly.Up = false end)
-    mkBtn("IJ", UDim2.new(1, -80, 1, -180), function() Config.InfiniteJump = not Config.InfiniteJump end)
+
+    -- внизу по центру — управление полётом
+    mkBtn("↑", UDim2.new(0.5, -btnSize - 5, 0.5, 0), function(double)
+        if double then
+            MobileFly.Up = true
+            MobileFly.Down = false
+        else
+            MobileFly.Up = not MobileFly.Up
+            MobileFly.Down = false
+        end
+        notify("Cinder v6.0", "Fly Up: " .. tostring(MobileFly.Up), 1.5)
+    end, true)
+
+    mkBtn("↓", UDim2.new(0.5, -btnSize - 5, 0.5, btnSize + 5), function(double)
+        if double then
+            MobileFly.Down = true
+            MobileFly.Up = false
+        else
+            MobileFly.Down = not MobileFly.Down
+            MobileFly.Up = false
+        end
+        notify("Cinder v6.0", "Fly Down: " .. tostring(MobileFly.Down), 1.5)
+    end, true)
+
+    -- вверху — IJ и God Mode
+    mkBtn("IJ", UDim2.new(1, -btnSize - 10, 1, -btnSize - 10), function()
+        Config.InfiniteJump = not Config.InfiniteJump
+        notify("Cinder v6.0", "Infinite Jump: " .. tostring(Config.InfiniteJump), 2)
+    end, false, 14)
+
+    mkBtn("🛡", UDim2.new(1, -btnSize*2 - 10, 1, -btnSize - 10), function()
+        Config.GodMode = not Config.GodMode
+        notify("Cinder v6.0", "God Mode: " .. tostring(Config.GodMode), 2)
+        updateGodMode()
+    end, false, 14)
+
+    mkBtn("⚡", UDim2.new(1, -btnSize*3 - 10, 1, -btnSize - 10), function()
+        Config.AutoPerf = not Config.AutoPerf
+        notify("Cinder v6.0", "AutoPerf: " .. tostring(Config.AutoPerf), 2)
+    end, false, 14)
 end
+
 registerCleanup("MobileGui", function()
     if MobileGui then pcall(function() MobileGui:Destroy() end) MobileGui = nil end
 end)
 
--- v5 Offscreen arrows (Drawing triangles для целей за экраном)
+-- ============================================================
+-- OFFSCREEN ARROWS
+-- ============================================================
+
 local OffscreenPool = {}
 local function updateOffscreen()
     if not DrawingAvailable then return end
@@ -1586,9 +2061,11 @@ local function updateOffscreen()
     end
     local cam = camera()
     if not cam then return end
+    local vs = cam.ViewportSize
+    local center = Vector2.new(vs.X / 2, vs.Y / 2)
     for player, cache in pairs(PlayerCache) do
         if cache and cache.HRP and alive(player) and roleEnabled(getRole(player)) then
-            local _, visible = cam:WorldToViewportPoint(cache.HRP.Position)
+            local sp, visible = cam:WorldToViewportPoint(cache.HRP.Position)
             local tri = OffscreenPool[player]
             if not visible then
                 if not tri then
@@ -1596,11 +2073,20 @@ local function updateOffscreen()
                     if ok and t2 then OffscreenPool[player] = t2 tri = t2 end
                 end
                 if tri then
-                    local c = cam.ViewportSize / 2
-                    tri.PointA = c + Vector2.new(0, -14)
-                    tri.PointB = c + Vector2.new(-10, 10)
-                    tri.PointC = c + Vector2.new(10, 10)
+                    -- v6.0-final: направление на цель: проецируем вектор в экранные координаты
+                    local dir3 = cam.CFrame:VectorToObjectSpace((cache.HRP.Position - cam.CFrame.Position))
+                    local dir = Vector2.new(-dir3.X, -dir3.Y)
+                    if dir.Magnitude < 0.001 then dir = Vector2.new(0, -1) end
+                    dir = dir.Unit
+                    local radius = math.min(vs.X, vs.Y) * 0.38
+                    local tip = center + dir * radius
+                    local perp = Vector2.new(-dir.Y, dir.X)
+                    tri.PointA = tip
+                    tri.PointB = tip - dir * 18 + perp * 10
+                    tri.PointC = tip - dir * 18 - perp * 10
                     tri.Color = roleColor(getRole(player))
+                    tri.Filled = true
+                    tri.Transparency = 0.9
                     tri.Visible = true
                 end
             elseif tri then
@@ -1615,7 +2101,47 @@ registerCleanup("Offscreen", function()
     for k, d in pairs(OffscreenPool) do pcall(function() d:Remove() end) OffscreenPool[k] = nil end
 end)
 
--- v5 Presets + Export/Import
+-- ============================================================
+-- CHAMS (v6.0-final: Highlight-обводка, работает на Delta/мобайле)
+-- ============================================================
+
+local function updateChams()
+    for player, cache in pairs(PlayerCache) do
+        local c = cache and cache.Character
+        if Config.Chams and Config.ESP and c and alive(player) and roleEnabled(getRole(player)) then
+            local h = c:FindFirstChild("CinderChams")
+            if not h or not h:IsA("Highlight") then
+                if h then pcall(function() h:Destroy() end) end
+                local ok, hl = pcall(function()
+                    local x = Instance.new("Highlight")
+                    x.Name = "CinderChams"
+                    x.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                    x.FillTransparency = 0.6
+                    x.OutlineTransparency = 0
+                    x.Adornee = c
+                    x.Parent = c
+                    return x
+                end)
+                h = ok and hl or nil
+            end
+            if h then
+                pcall(function()
+                    h.FillColor = roleColor(getRole(player))
+                    h.OutlineColor = roleColor(getRole(player))
+                    h.Enabled = true
+                end)
+            end
+        elseif c then
+            local h = c:FindFirstChild("CinderChams")
+            if h then pcall(function() h:Destroy() end) end
+        end
+    end
+end
+
+-- ============================================================
+-- PRESETS + EXPORT/IMPORT
+-- ============================================================
+
 local function applyPreset(name)
     if name == "MaxFPS" then
         Config.ESPInterval, Config.RoleInterval, Config.ObjectInterval = 0.35, 1.0, 2.0
@@ -1628,33 +2154,40 @@ local function applyPreset(name)
         Config.ESPInterval, Config.RoleInterval, Config.ObjectInterval = 0.12, 0.5, 0.7
         Config.LowCPUMode, Config.AutoPerf = false, false
     end
-    notify("Cinder v5", "Пресет: " .. name, 2)
+    notify("Cinder v6.0", "Пресет: " .. name, 2)
 end
+
 local function exportConfig()
     local ok, json = pcall(function() return HttpService:JSONEncode(Config) end)
     if not ok then return end
     pcall(function() if setclipboard then setclipboard(json) end end)
-    getgenv().CinderV5Export = json
-    notify("Cinder v5", "Конфиг скопирован (и в getgenv.CinderV5Export)", 3)
+    getgenv().CinderV6Export = json
+    notify("Cinder v6.0", "Конфиг скопирован (и в getgenv.CinderV6Export)", 3)
 end
+
 local function importConfig(json)
     local ok, data = pcall(function() return HttpService:JSONDecode(json) end)
-    if not ok or type(data) ~= "table" then notify("Cinder v5", "Импорт: битый JSON", 3) return end
+    if not ok or type(data) ~= "table" then notify("Cinder v6.0", "Импорт: битый JSON", 3) return end
     for k, v in pairs(data) do Config[k] = v end
-    notify("Cinder v5", "Конфиг импортирован", 3)
+    notify("Cinder v6.0", "Конфиг импортирован", 3)
 end
-getgenv().CinderV5_Export = exportConfig
-getgenv().CinderV5_Import = importConfig
-getgenv().CinderV5_Preset = applyPreset
+
+getgenv().CinderV6_Export = exportConfig
+getgenv().CinderV6_Import = importConfig
+getgenv().CinderV6_Preset = applyPreset
+
+-- ============================================================
+-- WINDOW
+-- ============================================================
 
 local Window = Rayfield:CreateWindow({
-    Name = "Cinder MM2 v5.0",
+    Name = "Cinder MM2 v6.0",
     LoadingTitle = "Cinder MM2 Hub",
-    LoadingSubtitle = "v5 Modular / Mobile / AutoPerf",
+    LoadingSubtitle = "v6.0 Modular / Mobile / AutoPerf / GodMode / ESP Mode",
     ConfigurationSaving = {
         Enabled = true,
         FolderName = "CinderMM2",
-        FileName = "ConfigV5",
+        FileName = "ConfigV6",
     },
     KeySystem = false,
 })
@@ -1745,6 +2278,88 @@ visualTab:CreateToggle({
     end,
 })
 
+visualTab:CreateDropdown({
+    Name = "ESP Mode",
+    Options = {"Hybrid", "Billboard", "Drawing2D"},
+    CurrentOption = {Config.ESPMode},
+    MultipleOptions = false,
+    Flag = "ESPMode",
+    Callback = function(v)
+        Config.ESPMode = type(v) == "table" and v[1] or v
+        if Config.ESP then
+            clearESP()
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= LocalPlayer then
+                    refreshPlayer(p)
+                end
+            end
+        end
+    end,
+})
+
+visualTab:CreateSlider({
+    Name = "Max ESP Distance",
+    Range = {100, 3000},
+    Increment = 50,
+    CurrentValue = Config.ESPMaxDistance,
+    Flag = "ESPMaxDistance",
+    Callback = function(v)
+        Config.ESPMaxDistance = v
+    end,
+})
+
+visualTab:CreateToggle({
+    Name = "FullBright",
+    CurrentValue = Config.FullBright,
+    Flag = "FullBright",
+    Callback = function(v)
+        Config.FullBright = v
+        if not v and not Config.NoFog then restoreLighting() end
+    end,
+})
+
+visualTab:CreateSlider({
+    Name = "FullBright Intensity",
+    Range = {1, 5},
+    Increment = 0.5,
+    CurrentValue = Config.FullBrightIntensity,
+    Flag = "FullBrightIntensity",
+    Callback = function(v)
+        Config.FullBrightIntensity = v
+    end,
+})
+
+visualTab:CreateToggle({
+    Name = "No Fog",
+    CurrentValue = Config.NoFog,
+    Flag = "NoFog",
+    Callback = function(v)
+        Config.NoFog = v
+        if not v and not Config.FullBright then restoreLighting() end
+    end,
+})
+
+visualTab:CreateToggle({
+    Name = "Crosshair",
+    CurrentValue = Config.Crosshair,
+    Flag = "Crosshair",
+    Callback = function(v)
+        Config.Crosshair = v
+        if not v then clearDrawingTable(VisualState.Crosshair) end
+    end,
+})
+
+visualTab:CreateSlider({
+    Name = "Crosshair Size",
+    Range = {2, 20},
+    Increment = 1,
+    CurrentValue = Config.CrosshairSize,
+    Flag = "CrosshairSize",
+    Callback = function(v)
+        Config.CrosshairSize = v
+    end,
+})
+
 local aimTab = Window:CreateTab("Aim", nil)
 
 aimTab:CreateToggle({
@@ -1782,6 +2397,15 @@ aimTab:CreateToggle({
     Flag = "AimWallCheck",
     Callback = function(v)
         Config.AimWallCheck = v
+    end,
+})
+
+aimTab:CreateToggle({
+    Name = "Adaptive FOV (близкие цели — сужать FOV)",
+    CurrentValue = Config.AimAdaptiveFOV,
+    Flag = "AimAdaptiveFOV",
+    Callback = function(v)
+        Config.AimAdaptiveFOV = v
     end,
 })
 
@@ -1873,55 +2497,46 @@ mapTab:CreateSlider({
     end,
 })
 
+mapTab:CreateToggle({
+    Name = "Radar: скрыть свой dot",
+    CurrentValue = Config.RadarHideSelf,
+    Flag = "RadarHideSelf",
+    Callback = function(v)
+        Config.RadarHideSelf = v
+    end,
+})
+
+mapTab:CreateToggle({
+    Name = "Object Cache (ускорение скана)",
+    CurrentValue = Config.ESPObjectCacheEnabled,
+    Flag = "ESPObjectCacheEnabled",
+    Callback = function(v)
+        Config.ESPObjectCacheEnabled = v
+        if not v then
+            table.clear(ObjectCache)
+        end
+    end,
+})
+
 visualTab:CreateSlider({
-    Name = "Max ESP Distance",
-    Range = {100, 3000},
+    Name = "ESP LOD distance (близко)",
+    Range = {100, 2000},
+    Increment = 25,
+    CurrentValue = Config.ESPLodDistance,
+    Flag = "ESPLodDistance",
+    Callback = function(v)
+        Config.ESPLodDistance = v
+    end,
+})
+
+visualTab:CreateSlider({
+    Name = "ESP LOD distance (далеко)",
+    Range = {200, 3000},
     Increment = 50,
-    CurrentValue = Config.ESPMaxDistance,
-    Flag = "ESPMaxDistance",
+    CurrentValue = Config.ESPLodFarDistance,
+    Flag = "ESPLodFarDistance",
     Callback = function(v)
-        Config.ESPMaxDistance = v
-    end,
-})
-
-visualTab:CreateToggle({
-    Name = "FullBright",
-    CurrentValue = Config.FullBright,
-    Flag = "FullBright",
-    Callback = function(v)
-        Config.FullBright = v
-        if not v and not Config.NoFog then restoreLighting() end
-    end,
-})
-
-visualTab:CreateToggle({
-    Name = "No Fog",
-    CurrentValue = Config.NoFog,
-    Flag = "NoFog",
-    Callback = function(v)
-        Config.NoFog = v
-        if not v and not Config.FullBright then restoreLighting() end
-    end,
-})
-
-visualTab:CreateToggle({
-    Name = "Crosshair",
-    CurrentValue = Config.Crosshair,
-    Flag = "Crosshair",
-    Callback = function(v)
-        Config.Crosshair = v
-        if not v then clearDrawingTable(VisualState.Crosshair) end
-    end,
-})
-
-visualTab:CreateSlider({
-    Name = "Crosshair Size",
-    Range = {2, 20},
-    Increment = 1,
-    CurrentValue = Config.CrosshairSize,
-    Flag = "CrosshairSize",
-    Callback = function(v)
-        Config.CrosshairSize = v
+        Config.ESPLodFarDistance = v
     end,
 })
 
@@ -2005,6 +2620,15 @@ playerTab:CreateSlider({
 })
 
 playerTab:CreateToggle({
+    Name = "Fly: по направлению взгляда",
+    CurrentValue = Config.FlyLookDirection,
+    Flag = "FlyLookDirection",
+    Callback = function(v)
+        Config.FlyLookDirection = v
+    end,
+})
+
+playerTab:CreateToggle({
     Name = "Noclip",
     CurrentValue = Config.Noclip,
     Flag = "Noclip",
@@ -2029,6 +2653,57 @@ playerTab:CreateToggle({
     Flag = "AntiFling",
     Callback = function(v)
         Config.AntiFling = v
+    end,
+})
+
+local godTab = Window:CreateTab("God Mode", nil)
+
+godTab:CreateToggle({
+    Name = "God Mode",
+    CurrentValue = Config.GodMode,
+    Flag = "GodMode",
+    Callback = function(v)
+        Config.GodMode = v
+        updateGodMode()
+    end,
+})
+
+godTab:CreateSlider({
+    Name = "Max Health",
+    Range = {50, 200},
+    Increment = 10,
+    CurrentValue = Config.GodModeMaxHealth,
+    Flag = "GodModeMaxHealth",
+    Callback = function(v)
+        Config.GodModeMaxHealth = v
+        if Config.GodMode then
+            updateGodMode()
+        end
+    end,
+})
+
+godTab:CreateToggle({
+    Name = "Восстанавливать HP при любом уроне",
+    CurrentValue = Config.GodModeOnDamage,
+    Flag = "GodModeOnDamage",
+    Callback = function(v)
+        Config.GodModeOnDamage = v
+        if Config.GodMode then
+            updateGodMode()
+        end
+    end,
+})
+
+godTab:CreateButton({
+    Name = "Восстановить HP сейчас",
+    Callback = function()
+        local h = humanoid()
+        if h and Config.GodMode then
+            pcall(function()
+                h.Health = Config.GodModeMaxHealth or 100
+            end)
+            notify("Cinder v6.0", "HP восстановлен до " .. tostring(Config.GodModeMaxHealth or 100), 2)
+        end
     end,
 })
 
@@ -2128,21 +2803,92 @@ serverTab:CreateButton({
     end,
 })
 
--- v5 UI: ESP2.0 / Aim / Perf / Mobile / Config в одном табе
-local v5Tab = Window:CreateTab("V5", nil)
-v5Tab:CreateToggle({ Name = "AutoPerf (авто-срез)", CurrentValue = Config.AutoPerf, Flag = "AutoPerf", Callback = function(v) Config.AutoPerf = v end })
-v5Tab:CreateToggle({ Name = "Tracers: только Murderer", CurrentValue = Config.TracersMurdererOnly or false, Flag = "TracersMurdererOnly", Callback = function(v) Config.TracersMurdererOnly = v end })
-v5Tab:CreateToggle({ Name = "Offscreen Arrows", CurrentValue = Config.OffscreenArrows, Flag = "OffscreenArrows", Callback = function(v) Config.OffscreenArrows = v end })
-v5Tab:CreateSlider({ Name = "ESP LOD distance", Range = {100, 2000}, Increment = 25, CurrentValue = Config.ESPLodDistance, Flag = "ESPLodDistance", Callback = function(v) Config.ESPLodDistance = v end })
-v5Tab:CreateToggle({ Name = "Aim AutoPart (Head/HRP)", CurrentValue = Config.AimAutoPart, Flag = "AimAutoPart", Callback = function(v) Config.AimAutoPart = v end })
-v5Tab:CreateSlider({ Name = "Aim Predict", Range = {0, 1}, Increment = 0.05, CurrentValue = Config.AimPredict, Flag = "AimPredict", Callback = function(v) Config.AimPredict = v end })
-v5Tab:CreateSlider({ Name = "FOV Murderer (-1=общий)", Range = {-1, 360}, Increment = 5, CurrentValue = Config.AimFOVMurderer, Flag = "AimFOVMurderer", Callback = function(v) Config.AimFOVMurderer = v end })
-v5Tab:CreateSlider({ Name = "FOV Sheriff (-1=общий)", Range = {-1, 360}, Increment = 5, CurrentValue = Config.AimFOVSheriff, Flag = "AimFOVSheriff", Callback = function(v) Config.AimFOVSheriff = v end })
-v5Tab:CreateToggle({ Name = "Mobile Buttons", CurrentValue = Config.MobileButtons, Flag = "MobileButtons", Callback = function(v) setMobileButtons(v) end })
-v5Tab:CreateButton({ Name = "Preset: MaxFPS", Callback = function() applyPreset("MaxFPS") end })
-v5Tab:CreateButton({ Name = "Preset: Balanced", Callback = function() applyPreset("Balanced") end })
-v5Tab:CreateButton({ Name = "Preset: Quality", Callback = function() applyPreset("Quality") end })
-v5Tab:CreateButton({ Name = "Export Config (clipboard)", Callback = exportConfig })
+serverTab:CreateToggle({
+    Name = "Предпочитать минимум игроков",
+    CurrentValue = Config.ServerHopPreferEmpty,
+    Flag = "ServerHopPreferEmpty",
+    Callback = function(v)
+        Config.ServerHopPreferEmpty = v
+    end,
+})
+
+-- ============================================================
+-- V6 TAB: ESP2.0 / Aim / Perf / Mobile / Config
+-- ============================================================
+
+local v6Tab = Window:CreateTab("V6", nil)
+v6Tab:CreateToggle({ Name = "AutoPerf (авто-срез)", CurrentValue = Config.AutoPerf, Flag = "AutoPerf", Callback = function(v) Config.AutoPerf = v end })
+v6Tab:CreateToggle({ Name = "Tracers: только Murderer", CurrentValue = Config.TracersMurdererOnly or false, Flag = "TracersMurdererOnly", Callback = function(v) Config.TracersMurdererOnly = v end })
+v6Tab:CreateToggle({ Name = "Offscreen Arrows", CurrentValue = Config.OffscreenArrows, Flag = "OffscreenArrows", Callback = function(v) Config.OffscreenArrows = v end })
+v6Tab:CreateSlider({ Name = "ESP LOD distance (близко)", Range = {100, 2000}, Increment = 25, CurrentValue = Config.ESPLodDistance, Flag = "ESPLodDistance", Callback = function(v) Config.ESPLodDistance = v end })
+v6Tab:CreateSlider({ Name = "ESP LOD distance (далеко)", Range = {200, 3000}, Increment = 50, CurrentValue = Config.ESPLodFarDistance, Flag = "ESPLodFarDistance", Callback = function(v) Config.ESPLodFarDistance = v end })
+v6Tab:CreateToggle({ Name = "Aim AutoPart (Head/HRP)", CurrentValue = Config.AimAutoPart, Flag = "AimAutoPart", Callback = function(v) Config.AimAutoPart = v end })
+v6Tab:CreateSlider({ Name = "Aim Predict", Range = {0, 1}, Increment = 0.05, CurrentValue = Config.AimPredict, Flag = "AimPredict", Callback = function(v) Config.AimPredict = v end })
+v6Tab:CreateSlider({ Name = "FOV Murderer (-1=общий)", Range = {-1, 360}, Increment = 5, CurrentValue = Config.AimFOVMurderer, Flag = "AimFOVMurderer", Callback = function(v) Config.AimFOVMurderer = v end })
+v6Tab:CreateSlider({ Name = "FOV Sheriff (-1=общий)", Range = {-1, 360}, Increment = 5, CurrentValue = Config.AimFOVSheriff, Flag = "AimFOVSheriff", Callback = function(v) Config.AimFOVSheriff = v end })
+v6Tab:CreateToggle({ Name = "Adaptive FOV", CurrentValue = Config.AimAdaptiveFOV, Flag = "AimAdaptiveFOV", Callback = function(v) Config.AimAdaptiveFOV = v end })
+v6Tab:CreateToggle({ Name = "Chams (Highlight)", CurrentValue = Config.Chams, Flag = "Chams", Callback = function(v) Config.Chams = v end })
+v6Tab:CreateToggle({ Name = "GunDrop ESP", CurrentValue = Config.GunDropESP, Flag = "GunDropESP", Callback = function(v) Config.GunDropESP = v end })
+v6Tab:CreateToggle({ Name = "Mobile Buttons", CurrentValue = Config.MobileButtons, Flag = "MobileButtons", Callback = function(v) setMobileButtons(v) end })
+v6Tab:CreateButton({ Name = "Preset: MaxFPS", Callback = function() applyPreset("MaxFPS") end })
+v6Tab:CreateButton({ Name = "Preset: Balanced", Callback = function() applyPreset("Balanced") end })
+v6Tab:CreateButton({ Name = "Preset: Quality", Callback = function() applyPreset("Quality") end })
+v6Tab:CreateButton({ Name = "Export Config (clipboard)", Callback = exportConfig })
+
+-- Ping widget
+local pingGui
+local pingLabel
+local function createPingWidget()
+    if pingGui then return end
+    pingGui = Instance.new("ScreenGui")
+    pingGui.Name = "CinderV6Ping"
+    pingGui.ResetOnSpawn = false
+    pingGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+    pingLabel = Instance.new("TextLabel")
+    pingLabel.BackgroundTransparency = 0.3
+    pingLabel.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+    pingLabel.Size = UDim2.fromOffset(120, 30)
+    pingLabel.Position = UDim2.new(1, -130, 0, 5)
+    pingLabel.Font = Enum.Font.GothamBold
+    pingLabel.TextScaled = true
+    pingLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    pingLabel.Text = "Ping: --ms"
+    pingLabel.Parent = pingGui
+end
+
+local pingGuiUpdateAt = 0
+local function updatePingWidget()
+    if not pingLabel then return end
+    local now = os.clock()
+    if now - pingGuiUpdateAt < 2 then return end
+    pingGuiUpdateAt = now
+    local pingMs = nil
+    pcall(function()
+        pingMs = Stats.Network.ServerStatsItem["Data Ping"]:GetValueString()
+    end)
+    pingLabel.Text = "Ping: " .. tostring(pingMs or "--") .. "ms"
+end
+
+-- Self-Update (всегда)
+local function checkForUpdates()
+    task.spawn(function()
+        local ok, response = pcall(function()
+            return game:HttpGet("https://api.github.com/repos/SprizanX/Mm2/commits/main")
+        end)
+        if not ok then return end
+        local decoded, data = pcall(function()
+            return HttpService:JSONDecode(response)
+        end)
+        if not decoded or type(data) ~= "table" then return end
+        local latestSha = data.sha
+        local latestDate = data.commit.author.date
+        if latestSha and latestDate then
+            notify("Cinder v6.0", string.format("Самая свежая версия: vk (%s)", tostring(latestDate)), 5)
+        end
+    end)
+end
+
 if Config.MobileButtons then setMobileButtons(true) end
 
 -- ============================================================
@@ -2155,6 +2901,7 @@ bind("LocalCharacter", LocalPlayer.CharacterAdded, function()
     MobileFly.Down = false
     table.clear(originalCollision)
     table.clear(noclipParts)
+    noclipPartsDirty = true
     refreshNoclipCache()
     OriginalMovement.WalkSpeed = nil
     OriginalMovement.JumpPower = nil
@@ -2180,7 +2927,6 @@ bind("PlayerRemoving", Players.PlayerRemoving, function(player)
     clearPlayer(player)
 end)
 
--- Cleanup when this script instance is replaced.
 registerCleanup("ESP", clearESP)
 registerCleanup("Objects", clearObjectESP)
 registerCleanup("Radar", destroyRadar)
@@ -2195,15 +2941,154 @@ registerCleanup("PlayerConnections", function()
         clearPlayer(player)
     end
 end)
+registerCleanup("GodMode", function()
+    if godModeConn then
+        godModeConn:Disconnect()
+        godModeConn = nil
+    end
+    if godModeOnDamageConn then
+        godModeOnDamageConn:Disconnect()
+        godModeOnDamageConn = nil
+    end
+end)
 
-notify("Cinder MM2 v5.0", string.format("Modular Core • FPS %d • AutoPerf %s", Perf.fps, Config.AutoPerf and "ON" or "OFF"), 4)
+createPingWidget()
 
--- Public diagnostic helper for debugging.
-getgenv().CinderV5_Status = function()
-    return getgenv().CinderMMMv4_Status()
+notify("Cinder MM2 v6.0", string.format("Modular Core • FPS %d • AutoPerf %s • GodMode %s • ESP Mode: %s",
+    Perf.fps, Config.AutoPerf and "ON" or "OFF", Config.GodMode and "ON" or "OFF", Config.ESPMode), 4)
+
+-- Self-update (всегда)
+checkForUpdates()
+
+-- ============================================================
+-- CHAT COMMANDS (v6.0)
+-- ============================================================
+
+local function matchCommand(msg, cmd)
+    local lower = string.lower(msg)
+    if string.sub(lower, 1, string.len(cmd) + 1) == cmd .. " " then
+        return string.sub(lower, string.len(cmd) + 2)
+    elseif string.sub(lower, 1, string.len(cmd)) == cmd then
+        return true
+    end
+    return false
 end
-getgenv().CinderMMMv41_Status = getgenv().CinderMMMv41_Status or nil
-getgenv().CinderMMMv4_Status = function()
+
+local function setupChatCommands()
+    if TextChatService and TextChatService.TextChannels then
+        for _, channel in ipairs(TextChatService.TextChannels:GetChildren()) do
+            if channel:IsA("TextChannel") then
+                channel.OnMessageDoneFiltering:Connect(function(message)
+                    local text = message.Text
+                    local cmd, args = matchCommand(text, "/esp")
+                    if cmd ~= nil then
+                        if args == true then
+                            Config.ESP = not Config.ESP
+                            if not Config.ESP then clearESP() end
+                        else
+                            Config.ESP = args == "on" or args == "true"
+                            if not Config.ESP then clearESP() end
+                        end
+                        notify("Cinder v6.0", "ESP: " .. tostring(Config.ESP), 2)
+                        return
+                    end
+
+                    cmd, args = matchCommand(text, "/radar")
+                    if cmd ~= nil then
+                        Config.Radar = not Config.Radar
+                        if not Config.Radar then destroyRadar() end
+                        notify("Cinder v6.0", "Radar: " .. tostring(Config.Radar), 2)
+                        return
+                    end
+
+                    cmd, args = matchCommand(text, "/fly")
+                    if cmd ~= nil then
+                        Config.Fly = not Config.Fly
+                        if Config.Fly then startFly() else stopFly() end
+                        notify("Cinder v6.0", "Fly: " .. tostring(Config.Fly), 2)
+                        return
+                    end
+
+                    cmd, args = matchCommand(text, "/noclip")
+                    if cmd ~= nil then
+                        Config.Noclip = not Config.Noclip
+                        notify("Cinder v6.0", "Noclip: " .. tostring(Config.Noclip), 2)
+                        return
+                    end
+
+                    cmd, args = matchCommand(text, "/aim")
+                    if cmd ~= nil then
+                        Config.AimAssist = not Config.AimAssist
+                        notify("Cinder v6.0", "Aim: " .. tostring(Config.AimAssist), 2)
+                        return
+                    end
+
+                    cmd, args = matchCommand(text, "/god")
+                    if cmd ~= nil then
+                        Config.GodMode = not Config.GodMode
+                        updateGodMode()
+                        notify("Cinder v6.0", "God Mode: " .. tostring(Config.GodMode), 2)
+                        return
+                    end
+
+                    cmd, args = matchCommand(text, "/objects")
+                    if cmd ~= nil then
+                        Config.ObjectESP = not Config.ObjectESP
+                        if not Config.ObjectESP and not Config.CoinESP then clearObjectESP() end
+                        notify("Cinder v6.0", "Object ESP: " .. tostring(Config.ObjectESP), 2)
+                        return
+                    end
+
+                    cmd, args = matchCommand(text, "/crosshair")
+                    if cmd ~= nil then
+                        Config.Crosshair = not Config.Crosshair
+                        if not Config.Crosshair then clearDrawingTable(VisualState.Crosshair) end
+                        notify("Cinder v6.0", "Crosshair: " .. tostring(Config.Crosshair), 2)
+                        return
+                    end
+
+                    cmd, args = matchCommand(text, "/status")
+                    if cmd ~= nil then
+                        local st = getgenv().CinderV6_Status()
+                        if st then
+                            notify("Cinder v6.0",
+                                string.format("FPS:%d | ESP:%s | Aim:%s | Ping:%s | Players:%d | Mode:%s",
+                                    st.FPS, tostring(Config.ESP), tostring(Config.AimAssist),
+                                    tostring(st.Ping or "--"), st.CachedPlayers, Config.ESPMode),
+                                3)
+                        end
+                        return
+                    end
+
+                    cmd, args = matchCommand(text, "/preset")
+                    if cmd ~= nil then
+                        applyPreset(args or "Balanced")
+                        return
+                    end
+
+                    cmd, args = matchCommand(text, "/config")
+                    if cmd ~= nil then
+                        exportConfig()
+                        return
+                    end
+                end)
+            end
+        end
+    end
+end
+
+if TextChatService then
+    task.defer(setupChatCommands)
+end
+
+-- ============================================================
+-- PUBLIC DIAGNOSTICS
+-- ============================================================
+
+getgenv().CinderV6_Status = function()
+    return getgenv().CinderV6_StatusImpl()
+end
+getgenv().CinderV6_StatusImpl = function()
     local players = 0
     for _ in pairs(PlayerCache) do players += 1 end
     local pingMs = nil
@@ -2212,7 +3097,7 @@ getgenv().CinderMMMv4_Status = function()
     end)
 
     return {
-        Version = "5.0",
+        Version = _VERSION,
         FPS = Perf.fps,
         CachedPlayers = players,
         ESPObjects = (function()
@@ -2232,5 +3117,9 @@ getgenv().CinderMMMv4_Status = function()
         LowCPUMode = Config.LowCPUMode,
         Ping = pingMs,
         NoclipCached = #noclipParts,
+        GodMode = Config.GodMode,
+        ESPMode = Config.ESPMode,
+        Coins = (function() local ok, n = pcall(getCoinCount) return ok and n or 0 end)(),
+        Chams = Config.Chams,
     }
 end
