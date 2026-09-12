@@ -1,5 +1,5 @@
 --[[
-    CINDER MM2 HUB v7.0
+    CINDER MM2 HUB v7.2
     Modular Core / Event-driven / Mobile + AutoPerf + GodMode + Farm
     Что нового в v7.0:
       • Профили конфига (3 слота, save/load, clipboard)
@@ -41,12 +41,55 @@
       • TouchTap на мобильных кнопках, cleanup FOV-GUI при выгрузке
 ]]
 
-local RayfieldSource = nil
-pcall(function()
-    RayfieldSource = game:HttpGet("https://sirius.menu/rayfield")
+-- v7.2: ранний индикатор загрузки (виден ДО меню) + retry докачки
+local bootT0 = os.clock()
+local BootGui = nil
+task.spawn(function()
+    local ok, pg = pcall(function() return game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui", 8) end)
+    if not ok or not pg then return end
+    local g = Instance.new("ScreenGui")
+    g.Name = "CinderBoot"
+    g.ResetOnSpawn = false
+    g.IgnoreGuiInset = true
+    g.DisplayOrder = 999
+    g.Parent = pg
+    local t = Instance.new("TextLabel")
+    t.Size = UDim2.fromOffset(280, 44)
+    t.Position = UDim2.new(0.5, -140, 0, 12)
+    t.BackgroundTransparency = 0.25
+    t.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+    t.Font = Enum.Font.GothamBold
+    t.TextScaled = true
+    t.TextColor3 = Color3.fromRGB(255, 220, 70)
+    t.Text = "Cinder v7.2: загрузка..."
+    t.Parent = g
+    BootGui = g
 end)
-assert(RayfieldSource and #RayfieldSource > 100, "Cinder v6.0: не удалось загрузить Rayfield (sirius.menu недоступен)")
-local Rayfield = loadstring(RayfieldSource)()
+local function bootNote(txt)
+    if BootGui then pcall(function() BootGui:GetChildren()[1].Text = txt end) end
+end
+
+local RayfieldSource = nil
+bootNote("Cinder v7.2: качаю меню...")
+for _ = 1, 3 do
+    pcall(function()
+        RayfieldSource = game:HttpGet("https://sirius.menu/rayfield")
+    end)
+    if RayfieldSource and #RayfieldSource > 100 then break end
+    bootNote("Cinder v7.2: повтор...")
+    task.wait(2)
+end
+if not (RayfieldSource and #RayfieldSource > 100) then
+    bootNote("Cinder: нет связи с sirius.menu")
+end
+assert(RayfieldSource and #RayfieldSource > 100, "Cinder: не удалось загрузить Rayfield (sirius.menu недоступен)")
+bootNote("Cinder v7.2: меню ок, старт...")
+local Rayfield = nil
+do
+    local ok, lib = pcall(function() return loadstring(RayfieldSource)() end)
+    if ok and lib then Rayfield = lib else bootNote("Cinder: битый Rayfield") end
+    assert(Rayfield, "Cinder: Rayfield не запустился")
+end
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -57,7 +100,6 @@ local Stats = game:GetService("Stats")
 local TextChatService = game:GetService("TextChatService")
 
 local LocalPlayer = Players.LocalPlayer
-local bootT0 = os.clock() -- v7.1
 local _VERSION = "6.0"
 
 -- ============================================================
@@ -2444,7 +2486,7 @@ getgenv().CinderV6_Preset = applyPreset
 -- ============================================================
 
 local Window = Rayfield:CreateWindow({
-    Name = "Cinder MM2 v7.0",
+    Name = "Cinder MM2 v7.2",
     LoadingTitle = "Cinder MM2 Hub",
     LoadingSubtitle = "v6.0 Modular / Mobile / AutoPerf / GodMode / ESP Mode",
     ConfigurationSaving = {
@@ -3257,9 +3299,9 @@ createPingWidget()
 
 notify("Cinder MM2 v7.1", string.format("Modular Core • загрузка %.1fc • AutoPerf %s • GodMode %s • ESP: %s",
     os.clock() - bootT0, Config.AutoPerf and "ON" or "OFF", Config.GodMode and "ON" or "OFF", Config.ESPMode), 4)
+if BootGui then pcall(function() BootGui:Destroy() end) BootGui = nil end
 
--- Self-update (всегда)
-checkForUpdates()
+-- v7.2: старый self-update убран (дублировал api-запрос и тормозил старт)
 
 -- ============================================================
 -- CHAT COMMANDS (v6.0)
