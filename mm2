@@ -41,6 +41,8 @@
       • TouchTap на мобильных кнопках, cleanup FOV-GUI при выгрузке
 ]]
 
+-- v7.3-arceusfix: порядок locals + Arceus-совместимость
+if table.clear == nil then function table.clear(t) for k in pairs(t) do t[k] = nil end end end
 -- v7.2: ранний индикатор загрузки (виден ДО меню) + retry докачки
 local bootT0 = os.clock()
 local BootGui = nil
@@ -71,12 +73,18 @@ end
 
 local RayfieldSource = nil
 bootNote("Cinder v7.2: качаю меню...")
-for _ = 1, 3 do
+local _req = (syn and syn.request) or (http and http.request) or http_request or request or fluxus_request
+for _ = 1, 5 do
     pcall(function()
         RayfieldSource = game:HttpGet("https://sirius.menu/rayfield")
+        if not (RayfieldSource and #RayfieldSource > 100) and _req then pcall(function()
+            local r = _req({Url = "https://sirius.menu/rayfield", Method = "GET"})
+            local body = type(r) == "table" and (r.Body or r.body or r.Content) or (type(r) == "string" and r or nil)
+            if body and #body > 100 then RayfieldSource = body end
+        end) end
     end)
     if RayfieldSource and #RayfieldSource > 100 then break end
-    bootNote("Cinder v7.2: повтор...")
+    bootNote("Cinder v7.3: повтор (" .. _ .. "/5)...")
     task.wait(2)
 end
 if not (RayfieldSource and #RayfieldSource > 100) then
@@ -100,7 +108,7 @@ local Stats = game:GetService("Stats")
 local TextChatService = game:GetService("TextChatService")
 
 local LocalPlayer = Players.LocalPlayer
-local _VERSION = "6.0"
+local _VERSION = "7.3-arceusfix"
 
 -- ============================================================
 -- CONFIG
@@ -340,6 +348,14 @@ local function restoreMovementStats()
     OriginalMovement.JumpPower = nil
 end
 
+-- (arceusfix: forward declares ABOVE shutdown, иначе shutdown/updateRoles видят nil-global)
+local refreshPlayer, clearPlayer, bindPlayer
+local destroyESP, clearESP, clearObjectESP
+local scanCharacter
+local detectRole
+local Perf, effectiveInterval
+local updateRoles, updateESP, scanObjects, updateOffscreen, updateChams
+Perf = { fps = 60, frameCount = 0, last = os.clock(), interval = 1, autoCut = false, autoCutTracers = false, autoCutObjects = false }
 local function shutdown()
     for name in pairs(Connections) do
         unbind(name)
@@ -360,9 +376,7 @@ end
 -- PLAYER CACHE
 -- ============================================================
 
-local refreshPlayer, clearPlayer, bindPlayer
-local destroyESP, clearESP, clearObjectESP
-local scanCharacter
+-- (original forward block moved above shutdown - arceusfix)
 
 local Core = { listeners = {} }
 function Core.on(event, fn)
@@ -497,7 +511,7 @@ local function normalizeRole(value)
     return "Unknown"
 end
 
-local function detectRole(player)
+detectRole = function(player)
     local cache = PlayerCache[player]
     if not cache then
         return "Unknown"
@@ -551,7 +565,7 @@ local function detectRole(player)
     return "Unknown"
 end
 
-local function updateRoles(force)
+updateRoles = function(force)
     local now = os.clock()
     for player, cache in pairs(PlayerCache) do
         if cache then
@@ -783,7 +797,7 @@ local function makeESP(player)
     ESP[player] = data
 end
 
-local function updateESP(now)
+updateESP = function(now)
     if not Config.ESP then
         if next(ESP) then clearESP() end
         return
@@ -986,7 +1000,7 @@ local function makeObjectESP(obj)
     ObjectESP[obj] = billboard
 end
 
-local function scanObjects(now)
+scanObjects = function(now)
     if not Config.ObjectESP and not Config.CoinESP then
         if next(ObjectESP) then clearObjectESP() end
         table.clear(ObjectCandidates)
@@ -1085,7 +1099,7 @@ local function createRadar()
     radarGui = Instance.new("ScreenGui")
     radarGui.Name = "CinderV3Radar"
     radarGui.ResetOnSpawn = false
-    radarGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    do local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:FindFirstChild("PlayerGui") if not pg then return end radarGui.Parent = pg end
 
     radarFrame = Instance.new("Frame")
     radarFrame.AnchorPoint = Vector2.new(1, 0)
@@ -1847,15 +1861,13 @@ end)
 -- PERFORMANCE MANAGER (v6.0: мгновенная реакция)
 -- ============================================================
 
-local Perf = {
-    fps = 60,
-    frameCount = 0,
-    last = os.clock(),
-    interval = 1,
-    autoCut = false,
-    autoCutTracers = false,
-    autoCutObjects = false,
-}
+Perf.fps = Perf.fps or 60
+Perf.frameCount = Perf.frameCount or 0
+Perf.last = Perf.last or os.clock()
+Perf.interval = Perf.interval or 1
+Perf.autoCut = Perf.autoCut or false
+Perf.autoCutTracers = Perf.autoCutTracers or false
+Perf.autoCutObjects = Perf.autoCutObjects or false
 
 bind("Performance", RunService.RenderStepped, function()
     Perf.frameCount += 1
@@ -1881,7 +1893,7 @@ bind("Performance", RunService.RenderStepped, function()
     end
 end)
 
-local function effectiveInterval(base)
+effectiveInterval = function(base)
     if not Config.LowCPUMode then
         return base
     end
@@ -2358,7 +2370,7 @@ end)
 -- ============================================================
 
 local OffscreenPool = {}
-local function updateOffscreen()
+updateOffscreen = function()
     if not DrawingAvailable then return end
     if not Config.OffscreenArrows or not Config.ESP then
         for _, d in pairs(OffscreenPool) do pcall(function() d.Visible = false end) end
@@ -2410,7 +2422,7 @@ end)
 -- CHAMS (v6.0-final: Highlight-обводка, работает на Delta/мобайле)
 -- ============================================================
 
-local function updateChams()
+updateChams = function()
     for player, cache in pairs(PlayerCache) do
         local c = cache and cache.Character
         if Config.Chams and Config.ESP and c and alive(player) and roleEnabled(getRole(player)) then
@@ -2490,7 +2502,7 @@ local Window = Rayfield:CreateWindow({
     LoadingTitle = "Cinder MM2 Hub",
     LoadingSubtitle = "v6.0 Modular / Mobile / AutoPerf / GodMode / ESP Mode",
     ConfigurationSaving = {
-        Enabled = true,
+        Enabled = (typeof(isfolder) == "function" and typeof(writefile) == "function"),
         FolderName = "CinderMM2",
         FileName = "ConfigV6",
     },
