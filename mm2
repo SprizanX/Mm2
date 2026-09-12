@@ -158,7 +158,7 @@ local Stats = game:GetService("Stats")
 local TextChatService = game:GetService("TextChatService")
 
 local LocalPlayer = Players.LocalPlayer
-local _VERSION = "9.1" -- v9.1: загрузчик с пином Rayfield в репо (фикс запуска)
+local _VERSION = "9.2" -- v9.2: убран goto (синтаксис-фикс запуска)
 
 -- ============================================================
 -- CONFIG
@@ -2147,30 +2147,28 @@ local function serverHop()
     local now = os.clock()
     if serverHopCacheAt > 0 and now - serverHopCacheAt < Config.ServerHopCacheTTL then
         local data = serverHopCache
-        if type(data) ~= "table" or type(data.data) ~= "table" then
-            goto fresh
-        end
-        local bestServer = pickBestServer(data.data)
-        if bestServer then
-            pcall(function()
-                TeleportService:TeleportToPlaceInstance(
-                    game.PlaceId,
-                    bestServer.id,
-                    LocalPlayer
-                )
-            end)
+        if type(data) == "table" and type(data.data) == "table" then -- v9.2: без goto (Roblox-Luau его не знает)
+            local bestServer = pickBestServer(data.data)
+            if bestServer then
+                pcall(function()
+                    TeleportService:TeleportToPlaceInstance(
+                        game.PlaceId,
+                        bestServer.id,
+                        LocalPlayer
+                    )
+                end)
+                return
+            end
+            Rayfield:Notify({
+                Title = "Server Hop",
+                Content = "Свободный сервер не найден (кеш).",
+                Duration = 3,
+            })
             return
         end
-        Rayfield:Notify({
-            Title = "Server Hop",
-            Content = "Свободный сервер не найден (кеш).",
-            Duration = 3,
-        })
-        return
     end
 
-    ::fresh::
-    -- v6.0-final: пагинация по nextPageCursor (до 3 страниц), иначе видны только первые 100
+    -- fresh: пагинация по nextPageCursor (до 3 страниц), иначе видны только первые 100
     local allServers = {}
     local cursor = ""
     for page = 1, 3 do
