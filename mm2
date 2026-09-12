@@ -1,4 +1,12 @@
 --[[
+    CINDER MM2 HUB v9.0
+    Что нового в v9.0:
+      • Ядро: реестр модулей — падение модуля не роняет хаб, ms по каждому тику в Status
+      • Роли: взвешенный скоринг (GUI/атрибуты/тулзы) + затухание вместо мигания Unknown
+      • Аим: режимы Rage/Legit, sticky-lock, приоритет угрозы, пресет Legit
+      • ESP: проекция HRP один раз на тик, дистанция/трейсер делят её
+      • Мобила: мини-панель ESP/AIM/RAD+FPS, команды /report /panel /mode
+      • Конфиг v9 с миграцией
     CINDER MM2 HUB v8.0  (SPEED UPDATE)
     Что нового в v8.0:
       • Загрузка: кэш Rayfield на диске (тёплый старт без сети) + фоновая ревалидация
@@ -139,7 +147,7 @@ local Stats = game:GetService("Stats")
 local TextChatService = game:GetService("TextChatService")
 
 local LocalPlayer = Players.LocalPlayer
-local _VERSION = "8.1"
+local _VERSION = "9.0" -- v9.0: модули, скоринг ролей, режимы аима, мини-панель
 
 -- ============================================================
 -- CONFIG
@@ -259,12 +267,24 @@ local Defaults = {
     AutoEvent = false,
     KillFeed = true,
     LastCommitSha = "",
+    -- v9.0
+    AimMode = "Rage", -- Rage | Legit
+    StickyLock = true,
+    ThreatPriority = false,
+    MiniPanel = false,
+    FrameBudget = 4,
 }
 
 for key, value in pairs(Defaults) do
     if Config[key] == nil then
         Config[key] = value
     end
+end
+
+-- v9.0: миграция конфига (штамп версии, чистка битых значений)
+if Config._cfgV ~= 9 then
+    Config._cfgV = 9
+    if Config.AimMode ~= "Legit" and Config.AimMode ~= "Rage" then Config.AimMode = "Rage" end
 end
 
 -- ============================================================
@@ -416,6 +436,33 @@ function Core.emit(event, ...)
     for _, fn in ipairs(ls) do pcall(fn, ...) end
 end
 
+-- v9.0 CORE: реестр модулей — изоляция тиков (падение модуля не роняет хаб) + ms-метрики
+local Cinder = getgenv().Cinder9 or { Modules = {}, Health = {}, notify = nil }
+getgenv().Cinder9 = Cinder
+local Modules, ModHealth = Cinder.Modules, Cinder.Health
+local function defModule(name, fn)
+    Modules[name] = fn
+    if ModHealth[name] == nil then ModHealth[name] = { ok = true, fails = 0, ms = 0 } end
+end
+local function tickModule(name, ...)
+    local fn = Modules[name]
+    if not fn then return end
+    local h = ModHealth[name]
+    local t0 = os.clock()
+    local ok = pcall(fn, ...)
+    h.ms = h.ms * 0.9 + (os.clock() - t0) * 1000 * 0.1
+    if ok then
+        h.fails = 0
+        h.ok = true
+    else
+        h.fails += 1
+        h.ok = false
+        if h.fails == 3 and Cinder.notify then
+            pcall(Cinder.notify, "Cinder v9.0", "Модуль " .. name .. " упал, пауза до рестарта", 3)
+        end
+    end
+end
+
 local PlayerCache = {}
 local RoleGuiCache = {} -- v7.1: закешированный StringValue роли
 
@@ -449,6 +496,7 @@ scanCharacter = function(player)
         RoleAt = 0,
         PendingRole = (old and old.PendingRole) or "Unknown",
         PendingCount = (old and old.PendingCount) or 0,
+        Score = (old and old.Score) or 0, -- v9.0: уверенность в роли
         ToolConns = {},
     }
 end
@@ -492,12 +540,22 @@ bindPlayer = function(player)
         if cache then table.clear(cache.ToolConns) end
         local function fastUpdate()
             if not PlayerCache[player] then return end
-            local r = detectRole(player)
+            local r, w = detectRole(player)
             if r ~= "Unknown" then
-                PlayerCache[player].LastRole = r
-                PlayerCache[player].PendingRole = r
-                PlayerCache[player].PendingCount = 2
-                Core.emit("role", player, r)
+                -- v9.0: сильный сигнал подтверждаем сразу, слабый копим
+                if (w or 0) >= 2 then
+                    PlayerCache[player].LastRole = r
+                    PlayerCache[player].PendingRole = r
+                    PlayerCache[player].Score = 3
+                    Core.emit("role", player, r)
+                else
+                    PlayerCache[player].PendingRole = r
+                    PlayerCache[player].Score = math.min(6, (PlayerCache[player].Score or 0) + (w or 1))
+                    if PlayerCache[player].Score >= 3 and PlayerCache[player].LastRole ~= r then
+                        PlayerCache[player].LastRole = r
+                        Core.emit("role", player, r)
+                    end
+                end
             end
         end
         table.insert(conns, char.ChildAdded:Connect(function(ch)
@@ -571,10 +629,11 @@ detectRole = function(player)
             end
         end
     end
+    -- v9.0: вес источника (GUI 3 > атрибуты 2 > тулзы 2/1)
     if value then
         local role = normalizeRole(value.Value)
         if role ~= "Unknown" then
-            return role
+            return role, 3
         end
     end
     local okAttr, attrRole = pcall(function()
@@ -582,7 +641,7 @@ detectRole = function(player)
     end)
     if okAttr and type(attrRole) == "string" then
         local role = normalizeRole(attrRole)
-        if role ~= "Unknown" then return role end
+        if role ~= "Unknown" then return role, 2 end
     end
     local function toolRole(container)
         if not container then return nil end
@@ -597,11 +656,11 @@ detectRole = function(player)
     end
     local c = cache.Character
     local r1 = toolRole(c)
-    if r1 then return r1 end
+    if r1 then return r1, 2 end -- в руках = сильный сигнал
     local bp = player:FindFirstChildOfClass("Backpack")
     local r2 = toolRole(bp)
-    if r2 then return r2 end
-    return "Unknown"
+    if r2 then return r2, 1 end -- в рюкзаке = слабый сигнал
+    return "Unknown", 0
 end
 
 updateRoles = function(force)
@@ -609,28 +668,37 @@ updateRoles = function(force)
     for player, cache in pairs(PlayerCache) do
         if cache then
             if force or now - cache.RoleAt >= effectiveInterval(Config.RoleInterval) then
-                local detected = detectRole(player)
-                if detected == "Unknown" then
-                    if cache.LastRole == "Unknown" or force then
-                        cache.LastRole = "Unknown"
-                    end
-                elseif detected == cache.LastRole then
+                -- v9.0: взвешенный скоринг (GUI мгновенно, атрибуты 2 тика, тулзы 3)
+                local detected, w = detectRole(player)
+                w = w or 0
+                if force and detected ~= "Unknown" then
+                    cache.LastRole = detected
                     cache.PendingRole = detected
-                    cache.PendingCount = 2
-                elseif detected == cache.PendingRole then
-                    cache.PendingCount = (cache.PendingCount or 0) + 1
-                    if cache.PendingCount >= 2 or force then
-                        if cache.LastRole ~= detected then
-                            cache.LastRole = detected
-                            Core.emit("role", player, detected)
-                        end
-                    end
-                else
-                    cache.PendingRole = detected
-                    cache.PendingCount = 1
-                    if force then
+                    cache.Score = 3
+                    Core.emit("role", player, detected)
+                elseif detected ~= "Unknown" and detected == cache.PendingRole then
+                    cache.Score = math.min(6, (cache.Score or 0) + w)
+                    if cache.Score >= 3 and cache.LastRole ~= detected then
                         cache.LastRole = detected
                         Core.emit("role", player, detected)
+                    end
+                elseif detected ~= "Unknown" then
+                    cache.PendingRole = detected
+                    cache.Score = w
+                    if w >= 3 and cache.LastRole ~= detected then
+                        cache.LastRole = detected
+                        Core.emit("role", player, detected)
+                    end
+                else
+                    -- v9.0: затухание уверенности вместо мгновенного Unknown (анти-мигание)
+                    cache.Score = (cache.Score or 0) - 1
+                    if cache.Score <= -3 then
+                        cache.Score = 0
+                        if cache.LastRole ~= "Unknown" then
+                            cache.LastRole = "Unknown"
+                            cache.PendingRole = "Unknown"
+                            Core.emit("role", player, "Unknown")
+                        end
                     end
                 end
                 cache.RoleAt = now
@@ -860,6 +928,13 @@ updateESP = function(now)
                 dist = (myRoot.Position - cache.HRP.Position).Magnitude
             end
 
+            -- v9.0: проекция HRP один раз на тик (трейсер делит её с дистанцией)
+            local pvX, pvY, pvVis = 0, 0, false
+            if cam and cache.HRP then
+                local pv, vis = cam:WorldToViewportPoint(cache.HRP.Position)
+                if vis and pv.Z > 0 then pvX, pvY, pvVis = pv.X, pv.Y, true end
+            end
+
             if dist > maxDist then
                 destroyESP(player)
                 continue
@@ -939,17 +1014,13 @@ updateESP = function(now)
                             tracerOk = false
                         end
                         if Perf.autoCut and Perf.autoCutTracers then tracerOk = false end
-                        if tracerOk and cam and myRoot and cache.HRP then
-                            local viewport, visible = cam:WorldToViewportPoint(cache.HRP.Position)
-                            if visible and viewport.Z > 0 then
-                                local from = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y)
-                                data.line.From = from
-                                data.line.To = Vector2.new(viewport.X, viewport.Y)
-                                data.line.Color = color
-                                data.line.Visible = true
-                            else
-                                data.line.Visible = false
-                            end
+                        -- v9.0: готовая проекция pvX/pvY (без повторного WorldToViewportPoint)
+                        if tracerOk and pvVis then
+                            local from = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y)
+                            data.line.From = from
+                            data.line.To = Vector2.new(pvX, pvY)
+                            if data._lcol ~= color then data.line.Color = color data._lcol = color end
+                            data.line.Visible = true
                         else
                             data.line.Visible = false
                         end
@@ -1401,6 +1472,7 @@ local function closestTarget()
     local best
     local bestDistance = math.huge
     local bestPriority = 0
+    local myHRP9 = Config.ThreatPriority and root() or nil -- v9.0
 
     for player, cache in pairs(PlayerCache) do
         if cache and cache.Humanoid and cache.Humanoid.Health > 0 then
@@ -1438,6 +1510,11 @@ local function closestTarget()
                     local d = math.sqrt(dx * dx + dy * dy)
                     local fov = roleFOV(role)
 
+                    -- v9.0: Legit ужимает FOV
+                    if Config.AimMode == "Legit" and fov > 90 then
+                        fov = 90
+                    end
+
                     -- v6.0: adaptive FOV — близкие цели сужают FOV
                     if Config.AimAdaptiveFOV and d < fov / 4 then
                         fov = fov / 2
@@ -1446,12 +1523,35 @@ local function closestTarget()
                     -- v8.1-opt: рейкаст ПОСЛЕДНИМ (самый дорогой; было до FOV-проверки)
                     if d <= fov and hasLineOfSight(part) then
                         local p = ROLE_PRIORITY[role] or 0
-                        if p > bestPriority or (p == bestPriority and d < bestDistance) then
+                        -- v9.0: угроза = роль + прицел + (опц.) близость к тебе
+                        local score = p * 10000 - d
+                        if myHRP9 then
+                            local okd, dd = pcall(function() return (part.Position - myHRP9.Position).Magnitude end)
+                            if okd and dd then score = score - dd * 2 end
+                        end
+                        if score > bestPriority * 10000 - bestDistance then
                             bestPriority = p
                             bestDistance = d
                             best = part
                         end
                     end
+                end
+            end
+        end
+    end
+
+    -- v9.0: sticky-lock с гистерезисом (не прыгать между целями в одном FOV)
+    if Config.StickyLock and AimLock.part and AimLock.part.Parent then
+        local kp, kv = cam:WorldToViewportPoint(AimLock.part.Position)
+        if kv and kp.Z > 0 then
+            local kdx, kdy = kp.X - mouse.X, kp.Y - mouse.Y
+            if math.sqrt(kdx * kdx + kdy * kdy) <= 450 then
+                local krole = nil
+                for pl, cc in pairs(PlayerCache) do
+                    if cc and (cc.Head == AimLock.part or cc.HRP == AimLock.part) then krole = getRole(pl) break end
+                end
+                if krole and targetAllowed(krole) and hasLineOfSight(AimLock.part) then
+                    return AimLock.part
                 end
             end
         end
@@ -1554,12 +1654,19 @@ bind("AimAssist", RunService.RenderStepped, function()
         AimLock.part = target
         AimLock.since = now
     end
-    if target and (Config.AimReaction or 0) > 0 and (now - AimLock.since) < Config.AimReaction then
+    -- v9.0: Legit зажимы (реакция от 0.1с, доводка до 0.3)
+    local react9 = Config.AimReaction or 0
+    local alpha9 = math.clamp(Config.AimSmooth, 0.01, 1)
+    if Config.AimMode == "Legit" then
+        react9 = math.max(react9, 0.1)
+        alpha9 = math.min(alpha9, 0.3)
+    end
+    if target and react9 > 0 and (now - AimLock.since) < react9 then
         return
     end
 
     if target and cam then
-        local alpha = math.clamp(Config.AimSmooth, 0.01, 1)
+        local alpha = alpha9
         if Config.AimHumanizer then
             local spd = 0
             pcall(function() spd = target.AssemblyLinearVelocity.Magnitude end)
@@ -2303,48 +2410,54 @@ local lastObjects = 0
 local lastRadar = 0
 local lastRoles = 0
 
+-- v9.0: регистрация модулей (все тики идут через tickModule)
+defModule("roles", function() updateRoles(false) pcall(updateRoundTrack) end)
+defModule("esp", function(now) updateESP(now) pcall(updateChams) pcall(updateSkeleton) end)
+defModule("objects", function(now) scanObjects(now) end)
+defModule("farm", function(now) pcall(updateFarm, now) end)
+defModule("radar", function() updateRadar() end)
+defModule("slow", function()
+    if Config.WalkSpeedEnabled or Config.JumpEnabled or OriginalMovement.WalkSpeed ~= nil or OriginalMovement.JumpPower ~= nil then setMovementStats() end
+    if Config.Noclip or next(originalCollision) ~= nil then noclipStep() end
+    updateClientVisuals()
+end)
+defModule("offscreen", function() pcall(updateOffscreen) end)
+
 bind("Scheduler", RunService.Heartbeat, function()
     local now = os.clock()
 
+    -- v9.0: все тики через реестр (изоляция падений + ms в ModHealth)
     if now - lastRoles >= effectiveInterval(Config.RoleInterval) then
-        updateRoles(false)
-        pcall(updateRoundTrack)
+        tickModule("roles")
         lastRoles = now
     end
 
     if now - lastESP >= effectiveInterval(Config.ESPInterval) then
-        local tE = os.clock()
-        updateESP(now)
-        pcall(updateChams)
-        pcall(updateSkeleton)
-        Perf.msESP = Perf.msESP * 0.9 + (os.clock() - tE) * 1000 * 0.1
+        tickModule("esp", now)
+        Perf.msESP = ModHealth.esp.ms
         lastESP = now
     end
 
     if Perf.autoCutObjects then
         -- пропускаем скан объектов при просадке
     elseif now - lastObjects >= effectiveInterval(Config.ObjectInterval) then
-        local tO = os.clock()
-        scanObjects(now)
-        Perf.msObj = Perf.msObj * 0.9 + (os.clock() - tO) * 1000 * 0.1
+        tickModule("objects", now)
+        Perf.msObj = ModHealth.objects.ms
         lastObjects = now
     end
-    pcall(updateFarm, now)
+    tickModule("farm", now)
 
     if now - lastRadar >= 0.20 then
-        local tR = os.clock()
-        updateRadar()
-        Perf.msRadar = Perf.msRadar * 0.9 + (os.clock() - tR) * 1000 * 0.1
+        tickModule("radar")
+        Perf.msRadar = ModHealth.radar.ms
         lastRadar = now
     end
 
-    if Config.WalkSpeedEnabled or Config.JumpEnabled or OriginalMovement.WalkSpeed ~= nil or OriginalMovement.JumpPower ~= nil then setMovementStats() end -- v8.0
-    if Config.Noclip or next(originalCollision) ~= nil then noclipStep() end -- v8.0
-    updateClientVisuals()
+    tickModule("slow")
     updateCrosshair()
     if now - (Perf._offAt or 0) >= 0.3 then
         Perf._offAt = now
-        pcall(updateOffscreen)
+        tickModule("offscreen")
     end
 end)
 
@@ -2355,6 +2468,7 @@ end)
 local NotifyQueue = {}
 local notifyBusy = false
 local function notify(title, content, duration)
+    getgenv().Cinder9.notify = notify -- v9.0: wire для tickModule
     table.insert(NotifyQueue, {title = title, content = content, duration = duration or 3})
     if notifyBusy then return end
     notifyBusy = true
@@ -2475,6 +2589,57 @@ end)
 -- ============================================================
 
 local OffscreenPool = {}
+-- v9.0: мини-панель (ESP/AIM/RAD + FPS) поверх игры, для мобилы без Rayfield
+local miniGui, miniFps = nil, nil
+local function setMiniPanel(v)
+    Config.MiniPanel = v
+    if not v then
+        unbind("MiniPanel")
+        if miniGui then pcall(function() miniGui:Destroy() end) miniGui, miniFps = nil, nil end
+        return
+    end
+    if miniGui then return end
+    local ok, pg = pcall(function() return LocalPlayer:WaitForChild("PlayerGui") end)
+    if not ok or not pg then return end
+    local g = Instance.new("ScreenGui")
+    g.Name = "CinderV9Mini"
+    g.ResetOnSpawn = false
+    g.IgnoreGuiInset = true
+    g.Parent = pg
+    local function mkBtn(txt, x, cb)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.fromOffset(64, 40)
+        b.Position = UDim2.fromOffset(x, 240)
+        b.Text = txt
+        b.Font = Enum.Font.GothamBold
+        b.TextScaled = true
+        b.BackgroundTransparency = 0.3
+        b.Parent = g
+        b.MouseButton1Click:Connect(function() cb(b) end)
+        return b
+    end
+    local function paint(b, on) b.BackgroundColor3 = on and COLOR_MURDERER or Color3.fromRGB(40, 40, 40) end
+    local bE = mkBtn("ESP", 10, function(b) Config.ESP = not Config.ESP if not Config.ESP then clearESP() end paint(b, Config.ESP) end)
+    local bA = mkBtn("AIM", 80, function(b) Config.AimAssist = not Config.AimAssist paint(b, Config.AimAssist) end)
+    local bR = mkBtn("RAD", 150, function(b) Config.Radar = not Config.Radar if not Config.Radar then destroyRadar() end paint(b, Config.Radar) end)
+    paint(bE, Config.ESP) paint(bA, Config.AimAssist) paint(bR, Config.Radar)
+    miniFps = Instance.new("TextLabel")
+    miniFps.Size = UDim2.fromOffset(140, 24)
+    miniFps.Position = UDim2.fromOffset(10, 210)
+    miniFps.BackgroundTransparency = 0.4
+    miniFps.Font = Enum.Font.Gotham
+    miniFps.TextScaled = true
+    miniFps.TextColor3 = COLOR_WHITE
+    miniFps.Text = ""
+    miniFps.Parent = g
+    miniGui = g
+    bind("MiniPanel", RunService.Heartbeat, function()
+        if miniFps then
+            miniFps.Text = string.format("FPS %d ESP %.1fms", Perf.fps, Perf.msESP)
+        end
+    end)
+end
+
 updateOffscreen = function()
     if not DrawingAvailable then return end
     if not Config.OffscreenArrows or not Config.ESP then
@@ -2588,6 +2753,15 @@ local function applyPreset(name)
     elseif name == "Quality" then
         Config.ESPInterval, Config.RoleInterval, Config.ObjectInterval = 0.12, 0.5, 0.7
         Config.LowCPUMode, Config.AutoPerf = false, false
+    elseif name == "Legit" then
+        -- v9.0: тихий режим
+        Config.AimMode, Config.AimAssist = "Legit", true
+        Config.AimFOV, Config.AimHumanizer = 90, true
+        Config.AimReaction = math.max(Config.AimReaction or 0, 0.12)
+        Config.StickyLock, Config.ThreatPriority = true, false
+        Config.ESPInterval, Config.RoleInterval, Config.ObjectInterval = 0.25, 1.0, 1.5
+        Config.ESPTracers, Config.Chams, Config.Skeleton = false, false, false
+        Config.LowCPUMode, Config.AutoPerf = true, true
     end
     notify("Cinder v6.0", "Пресет: " .. name, 2)
 end
@@ -2616,9 +2790,9 @@ getgenv().CinderV6_Preset = applyPreset
 -- ============================================================
 
 local Window = Rayfield:CreateWindow({
-    Name = "Cinder MM2 v8.0",
+    Name = "Cinder MM2 v9.0",
     LoadingTitle = "Cinder MM2 Hub",
-    LoadingSubtitle = "v8.0 Speed / Mobile / AutoPerf",
+    LoadingSubtitle = "v9.0 Modules / Aim Modes / MiniPanel",
     ConfigurationSaving = {
         Enabled = (typeof(isfolder) == "function" and typeof(writefile) == "function"),
         FolderName = "CinderMM2",
@@ -2885,6 +3059,31 @@ aimTab:CreateSlider({
     Callback = function(v)
         Config.AimSmooth = v
     end,
+})
+
+aimTab:CreateDropdown({
+    Name = "Mode (Rage / Legit)",
+    Options = {"Rage", "Legit"},
+    CurrentOption = {Config.AimMode},
+    MultipleOptions = false,
+    Flag = "AimMode",
+    Callback = function(v)
+        Config.AimMode = type(v) == "table" and v[1] or v
+    end,
+})
+
+aimTab:CreateToggle({
+    Name = "Sticky Lock",
+    CurrentValue = Config.StickyLock,
+    Flag = "StickyLock",
+    Callback = function(v) Config.StickyLock = v end,
+})
+
+aimTab:CreateToggle({
+    Name = "Threat Priority",
+    CurrentValue = Config.ThreatPriority,
+    Flag = "ThreatPriority",
+    Callback = function(v) Config.ThreatPriority = v end,
 })
 
 local mapTab = Window:CreateTab("Map", nil)
@@ -3544,6 +3743,40 @@ local function setupChatCommands()
                         exportConfig()
                         return
                     end
+
+                    cmd, args = matchCommand(text, "/report")
+                    if cmd ~= nil then
+                        local st = getgenv().CinderV6_Status()
+                        if st then
+                            local txt = string.format("Cinder v%s FPS:%d ESP:%.1fms OBJ:%.1fms RADAR:%.1fms AIM:%.1fms Players:%d Ping:%s",
+                                tostring(st.Version), st.FPS, st.MsESP or 0, st.MsObj or 0,
+                                st.MsRadar or 0, st.MsAim or 0, st.CachedPlayers, tostring(st.Ping or "--"))
+                            pcall(function()
+                                if setclipboard then setclipboard(txt)
+                                elseif toclipboard then toclipboard(txt) end
+                            end)
+                            notify("Cinder v9.0", txt, 4)
+                        end
+                        return
+                    end
+
+                    cmd, args = matchCommand(text, "/panel")
+                    if cmd ~= nil then
+                        setMiniPanel(not Config.MiniPanel)
+                        notify("Cinder v9.0", "MiniPanel: " .. tostring(Config.MiniPanel), 2)
+                        return
+                    end
+
+                    cmd, args = matchCommand(text, "/mode")
+                    if cmd ~= nil then
+                        if args == "legit" or args == "rage" then
+                            Config.AimMode = (args == "legit") and "Legit" or "Rage"
+                        else
+                            Config.AimMode = (Config.AimMode == "Legit") and "Rage" or "Legit"
+                        end
+                        notify("Cinder v9.0", "AimMode: " .. Config.AimMode, 2)
+                        return
+                    end
                 end)
             end
         end
@@ -3553,6 +3786,8 @@ end
 if TextChatService then
     task.defer(setupChatCommands)
 end
+
+if Config.MiniPanel then task.defer(function() setMiniPanel(true) end) end -- v9.0
 
 -- ============================================================
 -- ============================================================
@@ -3630,6 +3865,13 @@ getgenv().CinderV6_StatusImpl = function()
         Chams = Config.Chams,
         Round = RoundTrack.round,
         Kills = RoundTrack.kills,
+        Mods = (function()
+            local t = {}
+            for name, h in pairs(ModHealth) do
+                t[name] = (h.ok and "" or "DOWN:") .. string.format("%.1fms", h.ms)
+            end
+            return t
+        end)(),
         MsESP = math.floor(Perf.msESP * 100) / 100,
         MsObj = math.floor(Perf.msObj * 100) / 100,
         MsRadar = math.floor(Perf.msRadar * 100) / 100,
